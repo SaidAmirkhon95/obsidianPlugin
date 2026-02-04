@@ -49,9 +49,10 @@ Run in a terminal inside the `plugins` directory:
 
 ```bash
 git clone https://github.com/SaidAmirkhon95/obsidianPlugin.git bachelor-said
+```
+---
 
-
-3️⃣ Install Node.js (if not installed)
+### 3️⃣ Install Node.js (if not installed)
 
 If Node.js is not installed yet:
 
@@ -66,11 +67,21 @@ Verify installation:
 node -v
 npm -v
 
+---
+
 cd bachelor-said
 npm install
+
+Replace Rows:
+69   openaiApiKey: "",
+70   groqApiKey: "",
+With separate provided keys!
+
 ---> npm run build <--- This generates the compiled plugin files used by Obsidian.
 
-5️⃣ Enable the plugin in Obsidian
+---
+
+### 5️⃣ Enable the plugin in Obsidian
 
 Open Obsidian:
 
@@ -82,9 +93,13 @@ Reload Obsidian:
 
 Command Palette → Reload app without saving or close & reopen Obsidian
 
-6️⃣ Verify installation
+---
+
+### 6️⃣ Verify installation
 
 After reload, you should see a 🗨️ message-square icon in the left sidebar.
+
+---
 
 How to Use
 Import PDF papers
@@ -98,6 +113,8 @@ The plugin will automatically:
 -generate summaries
 -index the content for search & chat
 
+---
+
 Ask questions about your papers:
 
 -Click the 🗨️ message-square icon
@@ -106,6 +123,8 @@ Ask questions about your papers:
 Ask questions about the current paper OR Add extra papers to the chat context.
 
 ⚠️ If you want to ask questions only about the current paper, remove extra papers from the context list.
+
+---
 
 🛠 Development Notes
 
