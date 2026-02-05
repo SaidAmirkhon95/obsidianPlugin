@@ -1015,7 +1015,10 @@ export default class BachelorSaidPlugin extends Plugin {
 		}
 	
 		const currentSummary = summaryMatch[1].trim();
-		const allFiles = this.app.vault.getMarkdownFiles(); // ✅ Einmal am Anfang definieren
+		
+		// ÄNDERUNG: Filtert nur Dateien im PAPERS_DIR (01_papers)
+		const allFiles = this.app.vault.getMarkdownFiles().filter(f => f.path.startsWith(this.PAPERS_DIR)); 
+		
 		const otherSummaries: { file: TFile; title: string; summary: string }[] = [];
 	
 		for (const file of allFiles) {
@@ -1033,7 +1036,7 @@ export default class BachelorSaidPlugin extends Plugin {
 		}
 	
 		if (otherSummaries.length === 0) {
-			new Notice("No other notes with summaries found.");
+			new Notice("No other notes with summaries found in papers directory.");
 			return [];
 		}
 	
@@ -1042,16 +1045,16 @@ export default class BachelorSaidPlugin extends Plugin {
 	
 		// ✅ Variable umbenannt zu llmPrompt (verhindert Konflikt mit window.prompt)
 		const llmPrompt = `
-		  You are given one academic paper summary and a list of other paper summaries.
-		  Identify which other summaries are relevant to the main one.
-		  Return ONLY the titles of the relevant ones, each on a new line. No explanation.
-		  Return at most ${limit} titles.
-		  
-		  Main Summary:
-		  ${currentSummary}
-		  
-		  Other Summaries:
-		  ${otherSummaries.map(s => `Title: ${s.title}\nSummary: ${s.summary}`).join('\n\n')}
+		 You are given one academic paper summary and a list of other paper summaries.
+		 Identify which other summaries are relevant to the main one.
+		 Return ONLY the titles of the relevant ones, each on a new line. No explanation.
+		 Return at most ${limit} titles.
+		
+		 Main Summary:
+		 ${currentSummary}
+		
+		 Other Summaries:
+		 ${otherSummaries.map(s => `Title: ${s.title}\nSummary: ${s.summary}`).join('\n\n')}
 		`;
 	
 		try {
@@ -1074,8 +1077,8 @@ export default class BachelorSaidPlugin extends Plugin {
 				if (file instanceof TFile) {
 					matchedFiles.push(file);
 				} else {
-					// Zweiter Versuch: Fuzzy Match im bereits existierenden allFiles Array
-					const fuzzyMatch = allFiles.find(f => 
+					// Zweiter Versuch: Fuzzy Match im bereits gefilterten allFiles Array
+					const fuzzyMatch = allFiles.find(f => 
 						title.toLowerCase().includes(f.basename.toLowerCase()) ||
 						f.basename.toLowerCase().includes(title.toLowerCase())
 					);
@@ -1393,33 +1396,34 @@ export default class BachelorSaidPlugin extends Plugin {
 		limit = 10,
 		minScore = 0.78
 	  ): Promise<{ file: TFile; score: number }[]> {
-	  
+	
 		const current = await this.getSummaryEmbedding(currentFile);
 		if (!current) {
 		  new Notice("Current note has no Summary section.");
 		  return [];
 		}
-	  
+	
+		// ÄNDERUNG: Filtert nur Dateien im PAPERS_DIR und schließt die aktuelle Datei aus
 		const allFiles = this.app.vault.getMarkdownFiles()
-		  .filter(f => f.path !== currentFile.path);
-	  
+		  .filter(f => f.path.startsWith(this.PAPERS_DIR) && f.path !== currentFile.path);
+	
 		const candidates: { file: TFile; score: number }[] = [];
-	  
+	
 		// optional: nur Notes mit Summary
 		for (const f of allFiles) {
 		  try {
 			const other = await this.getSummaryEmbedding(f);
 			if (!other) continue;
-	  
+	
 			const score = this.cosineSimilarity(current.vec, other.vec);
 			if (score >= minScore) {
-			  candidates.push({ file: f, score });
+			 candidates.push({ file: f, score });
 			}
 		  } catch (e) {
 			console.warn("Similarity check failed for", f.path, e);
 		  }
 		}
-	  
+	
 		candidates.sort((a, b) => b.score - a.score);
 		return candidates.slice(0, limit);
 	}
@@ -2424,7 +2428,6 @@ date: ${new Date().toISOString().slice(0, 10)}
 		// Kürzen, um Token zu sparen
 		const truncatedRefs = referencesRaw.slice(0, 15000);
 
-		// PROMPT UPDATE: Viel strenger ("JSON ONLY", "NO CONVERSATION")
 		const refPrompt = `You are a machine that outputs strict JSON. You do not speak.
 Task: Extract academic references from the text below.
 
@@ -2432,35 +2435,49 @@ INPUT TEXT:
 ${truncatedRefs}
 
 INSTRUCTIONS:
-1. Identify academic papers/books. Ignore websites or incomplete garbage.
-2. Fix broken lines (merge titles).
-3. Extract fields: Title, Authors (list), Year, Venue.
-4. OUTPUT FORMAT: STRICT JSON Array. Do NOT use Markdown code blocks. Do NOT write an intro.
-Example:
-[{"title": "Deep Learning", "authors": ["LeCun, Y.", "Bengio, Y."], "year": "2015", "venue": "Nature", "isAcademic": true}]
+1. Identify academic papers/books. Ignore websites.
+2. Fix broken lines.
+3. OUTPUT FORMAT: STRICT JSON Array of objects with keys: "title", "authors" (array), "year", "venue", "isAcademic" (boolean).
+4. ESCAPE all backslashes (e.g. use "\\\\" for LaTeX) and quotes inside strings.
+5. Do NOT use Markdown code blocks. Just the raw JSON string.
 
 JSON OUTPUT:`;
 	
 		const response = await this.processWithLlama3(refPrompt);
-		const content = response.message.content;
+		let content = response.message.content.trim();
+
+		// Markdown Code-Blöcke entfernen, falls das LLM sie doch schreibt
+		content = content.replace(/^```json/, '').replace(/^```/, '').replace(/```$/, '').trim();
 
 		try {
-			// VERSUCH 1: JSON Extraktion (Der ideale Weg)
-			// Sucht nach [...] und ignoriert Text davor/danach
+			// VERSUCH 1: Direkte JSON Suche
 			const jsonMatch = content.match(/\[\s*\{[\s\S]*\}\s*\]/);
 			if (jsonMatch) {
-				return JSON.parse(jsonMatch[0]);
+				const jsonString = jsonMatch[0];
+				try {
+					return JSON.parse(jsonString);
+				} catch (innerError) {
+					// VERSUCH 1.5: Häufige JSON-Fehler bereinigen
+					// Backslashes, die nicht escaped sind, korrigieren (oft in LaTeX Titeln)
+					// Dies ist ein naiver Fix, hilft aber oft bei "Bad escaped character"
+					const sanitized = jsonString.replace(/\\/g, "\\\\"); 
+					try {
+						return JSON.parse(sanitized);
+					} catch (e) {
+						console.warn("JSON sanitization failed:", e);
+						throw e; // Weiter zum Fallback
+					}
+				}
 			}
-			
-			// Wenn wir hier sind, hat das LLM kein JSON geliefert.
-			console.warn("LLM did not return JSON. Trying text fallback parsing...");
-			
-			// VERSUCH 2: Fallback für nummerierte Listen (wie in deinem Log)
-			return this.parseFallbackTextList(content);
+			throw new Error("No JSON array found");
 
 		} catch (e) {
-			console.error("Failed to parse reference data", e);
-			return [];
+			console.warn("LLM did not return valid JSON. Switching to text fallback parsing...", e);
+			
+			// VERSUCH 2: Fallback für nummerierte Listen
+			// Wenn JSON knallt, nehmen wir einfach den Text-Parser. 
+			// Das verhindert den Absturz des Plugins.
+			return this.parseFallbackTextList(content);
 		}
 	}
 
@@ -2591,13 +2608,16 @@ JSON OUTPUT:`;
 	}
 
 	async handleDroppedPDF(file: File) {
+		const loadingModal = new DragAndDropModal(this.app, `<i>Loading PDF and extracting metadata...</i>`);
+		
 		try {
-			const loadingModal = new DragAndDropModal(this.app, `<i>Loading PDF and extracting metadata...</i>`);
 			loadingModal.open();
 	
 			const fileBuffer = await file.arrayBuffer();
+			// WICHTIG: Buffer kopieren, da manche Operationen ihn "verbrauchen"
 			const metadataBuffer = fileBuffer.slice(0);
 			const binaryBuffer = fileBuffer.slice(0);
+			
 			const { text: pdfText, metadata: pdfInternalMetadata } = await this.extractPDFContent(metadataBuffer);
 	
 			const title = file.name.replace(/\.pdf$/i, "").trim();
@@ -2629,8 +2649,8 @@ JSON OUTPUT:`;
 	
 			const authors = authorsMatch ? authorsMatch[1].split(/,| and /).map(a => a.trim()) : ["Unknown Author"];
 			const normalizedAuthors = authors
-			.map(a => this.normalizeAuthorName(a))
-			.filter(a => !!a);
+				.map(a => this.normalizeAuthorName(a))
+				.filter(a => !!a);
 
 			const finalAuthors = normalizedAuthors.length ? normalizedAuthors : ["Unknown Author"];
 			const conferenceOrJournal = confMatch ? confMatch[1].trim() : "Unknown Conference/Journal";
@@ -2641,37 +2661,37 @@ JSON OUTPUT:`;
 					? pdfInternalMetadata.year
 					: "Unknown Year";
 	
-					// === Vorbereitung der Daten ===
-					const createdDate = new Date().toISOString().slice(0, 10);
+			// === Vorbereitung der Daten ===
+			const createdDate = new Date().toISOString().slice(0, 10);
 
-					// Optional: als Wikilinks anzeigen (wie im Properties-UI als klickbare Chips)
-					const titleLink = `[[${title.replace(/"/g, "'")}]]`;
-					const authorLinks = finalAuthors.map(a => `[[${a}]]`);
-					const conferenceLink = `[[${conferenceOrJournal.replace(/"/g, "'")}]]`;
-					const keywordLinks = keywords.map(k => `[[${k}]]`);
-					
-					const yamlFrontmatter = [
-		"---",
-		`title: "${titleLink}"`, 
-		`date: ${createdDate}`,               // Obsidian mag "date" sehr (dein Screenshot nutzt date)
-		"author:",                            // Singular wie in deinem "richtigen" Screenshot
-		...authorLinks.map(a => `  - "${a.replace(/"/g, "'")}"`),
-		...(emails.length
-			? ["emails:", ...emails.map(e => `  - "${e.replace(/"/g, "'")}"`)]
-			: []),
-		`conference: "${conferenceLink}"`,
-		"keywords:",
-		...keywordLinks.map(k => `  - "${k.replace(/"/g, "'")}"`),
-		`year: ${String(year).replace(/"/g, "")}`,
-		`source_file: "${file.name.replace(/"/g, "'")}"`,
-		"tags:",
-		"  - type/paper",
-		"  - source/pdf",
-		"  - status/imported",
-		`template_version: "1.0"`,
-		"---",
-		"" // Leerzeile nach Frontmatter
-	].join("\n");					
+			// Optional: als Wikilinks anzeigen (wie im Properties-UI als klickbare Chips)
+			const titleLink = `[[${title.replace(/"/g, "'")}]]`;
+			const authorLinks = finalAuthors.map(a => `[[${a}]]`);
+			const conferenceLink = `[[${conferenceOrJournal.replace(/"/g, "'")}]]`;
+			const keywordLinks = keywords.map(k => `[[${k}]]`);
+			
+			const yamlFrontmatter = [
+				"---",
+				`title: "${titleLink}"`, 
+				`date: ${createdDate}`,
+				"author:",
+				...authorLinks.map(a => `  - "${a.replace(/"/g, "'")}"`),
+				...(emails.length
+					? ["emails:", ...emails.map(e => `  - "${e.replace(/"/g, "'")}"`)]
+					: []),
+				`conference: "${conferenceLink}"`,
+				"keywords:",
+				...keywordLinks.map(k => `  - "${k.replace(/"/g, "'")}"`),
+				`year: ${String(year).replace(/"/g, "")}`,
+				`source_file: "${file.name.replace(/"/g, "'")}"`,
+				"tags:",
+				"  - type/paper",
+				"  - source/pdf",
+				"  - status/imported",
+				`template_version: "1.0"`,
+				"---",
+				"" // Leerzeile nach Frontmatter
+			].join("\n");
 	
 			// === Step 2: Summarize in Chunks ===
 			loadingModal.updateContent(`<i>Metadata extracted. Summarizing full paper in chunks...</i>`);
@@ -2703,79 +2723,56 @@ JSON OUTPUT:`;
 	${summaries.map((s, idx) => `Summary ${idx + 1}: ${s}`).join('\n\n')}
 	--- END ---`;
 
-			// Extraktion der Blöcke
-			const refsRaw = this.extractReferencesBlock(cleanedText).join("\n");
-
-			if (refsRaw.length > 100) {
-				loadingModal.updateContent(`<i>Prüfe Referenzen auf wissenschaftliche Relevanz...</i>`);
-				
-				const extractedRefs = await this.extractStructuredReferences(refsRaw);
-
-				for (const ref of extractedRefs) {
-					// Validierung: Nur wenn es ein akademisches Werk ist und der Titel kein Autor ist
-					if (ref.isAcademic && ref.title && ref.title.length > 10) {
-						
-						// Check: Ist der Titel vielleicht nur ein Name? (Heuristik)
-						const isJustNames = ref.title.split(" ").length < 3 && ref.title.includes(",");
-						if (isJustNames) continue;
-
-						await this.upsertCitedPaperNote(ref);
-					}
-				}
-			}
-	
 			const finalSummaryResponse = await this.processWithLlama3(consolidatePrompt);
 			const finalSummary = finalSummaryResponse.message.content.trim();
-			const summaryBlock = `## Summary\n${finalSummary}`;
 			
-			// === ZITATE & REFERENZEN EXTRAHIEREN ===
-			// Wir nutzen den fullText (cleanedText), um am Ende nach Referenzen zu suchen
-			const refBlockRaw = this.extractReferencesBlock(cleanedText);
-			
-			if (refBlockRaw.length > 0 && refBlockRaw[0].length > 100) {
-				loadingModal.updateContent(`<i>🔍 Found references. Analyzing and creating notes for cited papers...</i>`);
+			// === ZITATE & REFERENZEN EXTRAHIEREN (SAFE MODE) ===
+			// Hier fangen wir Fehler ab, damit der Haupt-Import nicht abbricht
+			try {
+				const refBlockRaw = this.extractReferencesBlock(cleanedText);
 				
-				// LLM Aufruf zum Parsen
-				const extractedRefs = await this.extractStructuredReferences(refBlockRaw[0]);
-				
-				let createdCount = 0;
-				// Iteriere über gefundene Referenzen
-				for (const ref of extractedRefs) {
-					// Nur verarbeiten, wenn es explizit als akademisch erkannt wurde
-					if (ref.isAcademic) {
-						await this.upsertCitedPaperNote(ref);
-						createdCount++;
+				if (refBlockRaw.length > 0 && refBlockRaw[0].length > 100) {
+					loadingModal.updateContent(`<i>🔍 Found references. Analyzing...</i>`);
+					
+					// LLM Aufruf zum Parsen
+					const extractedRefs = await this.extractStructuredReferences(refBlockRaw[0]);
+					
+					let createdCount = 0;
+					for (const ref of extractedRefs) {
+						if (ref.isAcademic) {
+							// Einzelne Fehler bei Referenzen ignorieren wir
+							await this.upsertCitedPaperNote(ref).catch(e => console.warn("Ref error", e));
+							createdCount++;
+						}
 					}
+					console.log(`Created ${createdCount} new notes from references.`);
 				}
-				console.log(`Created ${createdCount} new notes from references.`);
-			} else {
-				console.log("No reference section found or too short.");
+			} catch (refError) {
+				console.error("Reference extraction failed (non-critical):", refError);
+				new Notice("Skipped reference extraction due to AI error.");
 			}
 
-			// === Save PDF to Vault ===
+			// === Save PDF to Vault (SAFE MODE) ===
 			const pdfFolder = "pdf";
-			let folderExists = this.app.vault.getAbstractFileByPath(pdfFolder);
-			if (!folderExists) {
-				await this.app.vault.createFolder(pdfFolder);
+			if (!this.app.vault.getAbstractFileByPath(pdfFolder)) {
+				await this.app.vault.createFolder(pdfFolder).catch(() => {});
 			}
 	
 			const pdfFileName = `${pdfFolder}/${file.name}`;
-			let vaultPdfFile = this.app.vault.getAbstractFileByPath(pdfFileName);
-			if (!vaultPdfFile) {
+			
+			// Prüfen ob Datei existiert, BEVOR wir schreiben
+			if (!this.app.vault.getAbstractFileByPath(pdfFileName)) {
 				await this.app.vault.createBinary(pdfFileName, binaryBuffer);
 			} else {
-				console.warn(`PDF file already exists in vault: ${pdfFileName}`);
+				new Notice(`PDF file already exists, linking to existing one.`);
 			}
 	
 			const pdfEmbed = `![[${pdfFileName}]]`;
 	
-			// ... (Vorheriger Code in handleDroppedPDF: Metadata extraction, Summary, PDF binary saving) ...
-
 			// === Final Note Body ===
-			// Das ist der neue, vollständige Inhalt (Metadata + Summary + PDF Embed)
 			const noteBody =
-  yamlFrontmatter +
-`## Summary
+			yamlFrontmatter +
+			`## Summary
 ${finalSummary}
 
 ## Full Text Extracted from PDF
@@ -2786,59 +2783,67 @@ ${pdfEmbed}
 `;
 	
 			// === NEUE LOGIK: Check, Move & Upgrade ===
-			
-			// 1. Wir suchen nach einer existierenden Notiz (in 01_papers ODER 04_quellen)
 			const existingNote = await this.findExistingPaperNote(title);
-
 			let finalFile: TFile;
 
 			if (existingNote) {
-				// Prüfen, wo die Datei liegt
 				const isInQuellen = existingNote.path.startsWith(this.QUELLEN_DIR);
 				const isInPapers = existingNote.path.startsWith(this.PAPERS_DIR);
 
 				if (isInPapers) {
-					// FALL A: Datei ist schon im Papers-Ordner -> Nichts tun, nur öffnen
+					// FALL A: Existiert schon fertig
 					new Notice("Paper already exists in library.");
 					finalFile = existingNote;
 				} 
 				else if (isInQuellen) {
-					// FALL B: Datei ist eine Referenz -> UPGRADE durchführen
-					loadingModal.updateContent(`<i>Found existing reference in ${this.QUELLEN_DIR}. Promoting to full paper...</i>`);
-					
-					// 1. Verschieben nach 01_papers
-					// app.fileManager.renameFile kümmert sich um das Verschieben und aktualisiert Links!
+					// FALL B: Upgrade Reference -> Paper
+					loadingModal.updateContent(`<i>Found reference. Upgrading to full paper...</i>`);
 					const newPath = `${this.PAPERS_DIR}/${existingNote.name}`;
-					await this.app.fileManager.renameFile(existingNote, newPath);
 					
-					// 2. Inhalt aktualisieren (Die alte Referenz-Notiz wird mit dem vollen Inhalt überschrieben)
-					// Wir warten kurz, damit Filesystem-Operationen sauber durchlaufen
-					await new Promise(r => setTimeout(r, 100));
-					await this.app.vault.modify(existingNote, noteBody);
-					
-					new Notice(`Upgraded reference to full paper: ${title}`);
-					finalFile = existingNote;
+					// Prüfen, ob das Ziel für das Verschieben frei ist
+					if (this.app.vault.getAbstractFileByPath(newPath)) {
+						// Ziel belegt -> Wir bleiben im Quellen-Ordner, aber aktualisieren den Inhalt
+						new Notice("Target filename busy. Updating existing reference note instead.");
+						await this.app.vault.modify(existingNote, noteBody);
+						finalFile = existingNote;
+					} else {
+						// Ziel frei -> Verschieben und Aktualisieren
+						await this.app.fileManager.renameFile(existingNote, newPath);
+						// Kurz warten für Dateisystem
+						await new Promise(r => setTimeout(r, 100));
+						await this.app.vault.modify(existingNote, noteBody);
+						finalFile = existingNote;
+						new Notice(`Upgraded reference to full paper.`);
+					}
 				} else {
-					// Fallback: Datei woanders gefunden? Trotzdem öffnen.
 					finalFile = existingNote;
 				}
 
 			} else {
-				// FALL C: Datei existiert noch gar nicht -> Neu erstellen
+				// FALL C: Neue Datei erstellen
 				await this.ensureFolder(this.PAPERS_DIR);
-				const noteFileName = `${this.PAPERS_DIR}/${this.sanitizeFileName(title)}.md`;
+				const safeTitle = this.sanitizeFileName(title);
+				let noteFileName = `${this.PAPERS_DIR}/${safeTitle}.md`;
 				
-				// Sicherheitshalber nochmal checken (AbstractFile), falls findExistingPaperNote was übersehen hat
-				const checkAgain = this.app.vault.getAbstractFileByPath(noteFileName);
-				if (checkAgain instanceof TFile) {
-					finalFile = checkAgain; // Sollte theoretisch nicht passieren dank Logic oben
-				} else {
+				// Namenskollision verhindern (z.B. gleiche Datei aber findExistingPaperNote hat sie übersehen)
+				if (this.app.vault.getAbstractFileByPath(noteFileName)) {
+					noteFileName = `${this.PAPERS_DIR}/${safeTitle} (1).md`;
+					new Notice("Filename existed. Created with suffix (1).");
+				}
+
+				// Finaler Check vor dem Erstellen
+				if (!this.app.vault.getAbstractFileByPath(noteFileName)) {
 					finalFile = await this.app.vault.create(noteFileName, noteBody);
 					new Notice(`Imported new paper: ${title}`);
+				} else {
+					// Sollte nicht passieren, aber sicher ist sicher
+					new Notice("Error: Could not create file (duplicate name).");
+					loadingModal.close();
+					return;
 				}
 			}
 
-			// ✅ Person & Conference Notes aktualisieren (wie gehabt)
+			// ✅ Person & Conference Notes aktualisieren
 			for (const a of finalAuthors) {
 				if (a && a !== "Unknown Author") {
 					await this.upsertPersonNote(a, title);
@@ -2846,9 +2851,8 @@ ${pdfEmbed}
 			}
 			if (conferenceOrJournal && conferenceOrJournal !== "Unknown Conference/Journal") {
 				await this.upsertConferenceNote(conferenceOrJournal, String(year), title);
-			}  
+			}
 
-			// Force open the note in a leaf
 			if (finalFile) {
 				const leaf = this.app.workspace.getLeaf(true);
 				await leaf.openFile(finalFile);
@@ -2857,16 +2861,19 @@ ${pdfEmbed}
 			loadingModal.close();
 			
 		} catch (error: any) {
-			// Error Handling wie gehabt...
 			const msg = String(error?.message ?? error);
 			if (msg.toLowerCase().includes("file already exists")) {
-			  new Notice("The file operation failed (File exists).");
+				new Notice("File collision detected during import.");
 			} else {
-			  new Notice("Failed to process dropped PDF: " + msg);
+				new Notice("Failed to process PDF: " + msg.slice(0, 100));
 			}
 			console.error("Error processing dropped PDF:", error);
-			// Falls Modal noch offen ist, schließen
-			// (Hier bräuchte man Zugriff auf die Instanz, falls sie scope-technisch noch da ist)
+			
+			// Versuchen das Modal zu schließen, falls es noch offen ist
+			try {
+				const modals = document.querySelectorAll('.modal-container');
+				modals.forEach(m => m.remove());
+			} catch(e) {}
 		}
 	}
 
@@ -2917,90 +2924,92 @@ ${pdfEmbed}
 	async runRelevanceAnalysis(currentFile: TFile) {
 		const currentNoteText = await this.app.vault.read(currentFile);
 		const currentSummary = this.extractSummaryFromNoteText(currentNoteText);
-	  
+	
 		if (!currentSummary) {
 		  new Notice("No summary found in current note.");
 		  return;
 		}
-	  
-		const allFiles = this.app.vault.getMarkdownFiles();
+	
+		// ÄNDERUNG: Filtert nur Dateien im PAPERS_DIR
+		const allFiles = this.app.vault.getMarkdownFiles().filter(f => f.path.startsWith(this.PAPERS_DIR));
+		
 		const others: { file: TFile; title: string; summary: string }[] = [];
-	  
+	
 		for (const file of allFiles) {
 		  if (file.path === currentFile.path) continue;
-	  
+	
 		  const text = await this.app.vault.read(file);
 		  const sum = this.extractSummaryFromNoteText(text);
 		  if (!sum) continue;
-	  
+	
 		  // Wichtig: Summary begrenzen, sonst zu langer Prompt
 		  const trimmed = sum.length > 2500 ? sum.slice(0, 2500) : sum;
-	  
+	
 		  others.push({ file, title: file.basename, summary: trimmed });
 		}
-	  
+	
 		if (others.length === 0) {
-		  new Notice("No other notes with summaries found.");
+		  new Notice("No other notes with summaries found in papers directory.");
 		  return;
 		}
-	  
+	
 		const loadingModal = new DragAndDropModal(this.app, "Looking for relevant papers...");
 		loadingModal.open();
-	  
+	
 		try {
 		  // Liste begrenzen (sonst Prompt explodiert)
 		  const MAX_CANDIDATES = 60;
 		  const candidates = others.slice(0, MAX_CANDIDATES);
-	  
+	
 		  const numbered = candidates
 			.map((s, i) => `${i + 1}) Title: ${s.title}\nSummary: ${s.summary}`)
 			.join("\n\n");
-	  
+	
 		  const prompt = `
-		  You are given one academic paper summary and a list of other paper summaries. 
-		  Identify which other summaries are relevant to the main one. 
-		  Return ONLY the titles of the relevant ones, each on a new line. Do not add any explanation.	  
-	  
+		  You are given one academic paper summary and a list of other paper summaries.
+		  Identify which other summaries are relevant to the main one.
+		  Return ONLY the titles of the relevant ones, each on a new line. Do not add any explanation.
+	
 	  Main Summary:
 	  ${currentSummary.length > 3000 ? currentSummary.slice(0, 3000) : currentSummary}
-	  
+	
 	  Other Summaries (numbered):
 	  ${numbered}
 	  `.trim();
-	  
+	
 		  const response = await this.processWithLlama3(prompt);
-	  
+	
 		  const raw = (response.message.content || "").trim();
-	  
+	
 		  // numbers like: "2, 5, 9" or lines with "2" "5"
 		  const nums = Array.from(raw.matchAll(/\b(\d{1,3})\b/g)).map(m => parseInt(m[1], 10));
 		  const uniq = Array.from(new Set(nums)).filter(n => n >= 1 && n <= candidates.length).slice(0, 12);
-	  
+	
 		  const relevantTitles = uniq.map(n => candidates[n - 1].title);
-	  
+	
 		  const relatedBlock =
 			`> [!Relevant papers]\n> ${
 			  relevantTitles.length ? relevantTitles.map(t => `[[${t}]]`).join("\n> ") : "None found."
 			}`;
-	  
+	
 		  // Insert block just before ## Summary, but remove old block first
 		  const summaryIndex = currentNoteText.search(/##\s*Summary/i);
 		  if (summaryIndex === -1) {
 			new Notice("Could not find Summary section to insert before.");
 			return;
 		  }
-	  
+	
 		  const beforeSummary = currentNoteText.slice(0, summaryIndex).trimEnd();
 		  const afterSummary = currentNoteText.slice(summaryIndex);
-	  
+	
 		  const cleanedBefore = beforeSummary.replace(
 			/^\s*>\s*\[!Relevant papers\][\s\S]*?(?=\n(?!\s*>)[^\n]|\s*$)/im,
 			""
 		  ).trimEnd();
-	  
+	
 		  const newNoteText = `${cleanedBefore}\n\n${relatedBlock}\n\n${afterSummary}`;
 		  await this.app.vault.modify(currentFile, newNoteText);
-	  
+	
 		  new Notice(`Relevant papers inserted (${relevantTitles.length}).`);
 		} finally {
 		  loadingModal.close();
@@ -3025,164 +3034,172 @@ ${pdfEmbed}
 
 	async extractPDFContent(fileBuffer: ArrayBuffer): Promise<{ text: string; metadata: any }> {
 		try {
-		  const loadingTask = getDocument({ data: fileBuffer });
-		  const pdf = await loadingTask.promise;
-	  
-		  const pagesText: string[] = [];
-	  
-		  // --- Helper 1: Noise Filter ---
-		  const isNoise = (item: PDFItem) => {
-			if (!item.str.trim()) return true;
-			if (item.h < 4) return true; // Winzige unsichtbare Texte
-			// Optional: Filtere vertikale Seitenzahlen am Rand, falls nötig
-			return false;
-		  };
-	  
-		  // --- Helper 2: Zeilen Formatierung ---
-		  // Verbindet einzelne Text-Schnipsel zu lesbaren Absätzen
-		  const formatLines = (items: PDFItem[]): string => {
-			if (items.length === 0) return "";
-			
-			// Sortiere strikt von oben nach unten, dann von links nach rechts
-			items.sort((a, b) => (b.y - a.y) || (a.x - b.x));
-	  
-			let out = "";
-			let lastY = items[0].y;
-			let lastItem: PDFItem = items[0];
-	  
-			for (let i = 0; i < items.length; i++) {
-			  const item = items[i];
-			  
-			  // Logik für Zeilenumbruch:
-			  // Wenn der vertikale Abstand größer ist als die halbe Höhe des Textes -> Neue Zeile
-			  const yDiff = Math.abs(item.y - lastY);
-			  
-			  if (i > 0 && yDiff > item.h * 0.5) {
-				// Prüfen, ob es ein neuer Absatz ist (größerer Abstand)
-				const isParagraph = yDiff > item.h * 1.5;
-				out += isParagraph ? "\n\n" : "\n";
-			  } else if (i > 0) {
-				// Gleiche Zeile: Leerzeichen einfügen, wenn Abstand horizontal da ist
-				const xDist = item.x - (lastItem.x + lastItem.w);
-				// Manchmal sind Buchstaben einzeln kodiert, daher kleiner Threshold (z.B. 2px)
-				if (xDist > 2 && !item.str.startsWith(" ") && !lastItem.str.endsWith(" ")) {
-				  out += " ";
+			const loadingTask = getDocument({ data: fileBuffer });
+			const pdf = await loadingTask.promise;
+	
+			const pagesText: string[] = [];
+	
+			// --- Helper 1: Noise Filter ---
+			const isNoise = (item: PDFItem) => {
+				if (!item.str.trim()) return true;
+				if (item.h < 3) return true; // Sehr kleine Artefakte filtern
+				return false;
+			};
+	
+			// --- Helper 2: Text Formatierung ---
+			const formatLines = (items: PDFItem[]): string => {
+				if (items.length === 0) return "";
+				
+				// Sortierung innerhalb einer Spalte/Zone: 
+				// 1. Vertikal (Y) von oben nach unten (b.y - a.y)
+				// 2. Horizontal (X) von links nach rechts
+				items.sort((a, b) => {
+					const yDiff = b.y - a.y;
+					// Toleranz für "gleiche Zeile": Wenn Unterschied kleiner als halbe Schrifthöhe
+					if (Math.abs(yDiff) > (Math.min(a.h, b.h) / 2)) return yDiff; 
+					return a.x - b.x; 
+				});
+	
+				let out = "";
+				let lastY = items[0].y;
+				let lastItem: PDFItem = items[0];
+	
+				for (let i = 0; i < items.length; i++) {
+					const item = items[i];
+					const yDiff = Math.abs(item.y - lastY);
+					
+					// Neuer Absatz Logik (wenn Y-Abstand signifikant größer als Zeilenhöhe)
+					if (i > 0 && yDiff > item.h * 0.6) { 
+						const isParagraph = yDiff > item.h * 1.5;
+						out += isParagraph ? "\n\n" : "\n";
+					} else if (i > 0) {
+						// Wortabstand Logik
+						const xDist = item.x - (lastItem.x + lastItem.w);
+						// Wenn Abstand existiert, aber nicht riesig ist -> Leerzeichen
+						if (xDist > 2 && !item.str.match(/^\s/) && !lastItem.str.match(/\s$/)) {
+							out += " ";
+						}
+					}
+	
+					out += item.str;
+					lastY = item.y;
+					lastItem = item;
 				}
-			  }
-	  
-			  out += item.str;
-			  lastY = item.y;
-			  lastItem = item;
+				return out;
+			};
+	
+			// --- Kern-Logik: Statistische Layout-Erkennung ---
+			const processPageItems = (items: PDFItem[], pageWidth: number, pageHeight: number): string => {
+				if (items.length === 0) return "";
+				
+				// 1. Header/Footer entfernen (Bereiche definieren)
+				const marginY = pageHeight * 0.05; 
+				const contentItems = items.filter(i => i.y > marginY && i.y < (pageHeight - marginY));
+	
+				// Vorsortierung Y (oben zuerst)
+				contentItems.sort((a, b) => b.y - a.y);
+	
+				const midX = pageWidth / 2;
+				const centerTolerance = pageWidth * 0.1; // 10% Zone in der Mitte
+	
+				// 2. Block-Bildung: Wir teilen die Seite vertikal in logische Blöcke.
+				// Ein "Wide Item" (z.B. Titel über die ganze Seite) erzwingt einen neuen Block.
+				const blocks: PDFItem[][] = [];
+				let currentBlock: PDFItem[] = [];
+	
+				for (const item of contentItems) {
+					// Check: Ist das Item "breit"? (Startet deutlich links, endet deutlich rechts)
+					const startsLeft = item.x < (midX - centerTolerance);
+					const endsRight = (item.x + item.w) > (midX + centerTolerance);
+					const isWide = startsLeft && endsRight;
+	
+					if (isWide) {
+						if (currentBlock.length > 0) {
+							blocks.push(currentBlock);
+							currentBlock = [];
+						}
+						blocks.push([item]); // Wide Item ist immer ein eigener (1-spaltiger) Block
+					} else {
+						currentBlock.push(item);
+					}
+				}
+				if (currentBlock.length > 0) blocks.push(currentBlock);
+	
+				let finalPageText = "";
+	
+				// 3. Block-Analyse
+				for (const block of blocks) {
+					if (block.length === 0) continue;
+	
+					// Entscheidung: 1-Spaltig oder 2-Spaltig?
+					// Wir zählen "Kollisionen" mit der Mittellinie.
+					
+					// Ein Element kollidiert, wenn es links der Mitte beginnt UND rechts der Mitte endet.
+					const centerCrossers = block.filter(i => i.x < midX && (i.x + i.w) > midX);
+					
+					// STATISTIK:
+					// Bei 1-Spaltigem Text kreuzen fast alle Zeilen die Mitte.
+					// Bei 2-Spaltigem Text kreuzt fast nichts die Mitte.
+					const collisionRate = centerCrossers.length / block.length;
+	
+					// Wenn weniger als 10% der Elemente die Mitte kreuzen, haben wir zwei Spalten.
+					// (Zusatzcheck: Block muss genug Elemente haben, um Statistik sinnvoll zu machen, z.B. > 5)
+					let isTwoColumn = false;
+					if (block.length > 5 && collisionRate < 0.1) {
+						// Prüfen ob wir wirklich Inhalte auf beiden Seiten haben
+						const hasLeft = block.some(i => (i.x + i.w) < midX);
+						const hasRight = block.some(i => i.x > midX);
+						if (hasLeft && hasRight) {
+							isTwoColumn = true;
+						}
+					}
+	
+					if (isTwoColumn) {
+						// === 2-Spalten Modus ===
+						// Teile Items anhand ihrer Mitte (sicherer als Start/Ende bei schiefen Scans)
+						const colL = block.filter(i => (i.x + i.w/2) < midX);
+						const colR = block.filter(i => (i.x + i.w/2) >= midX);
+	
+						// Erst Links komplett rendern, dann Rechts komplett rendern
+						finalPageText += formatLines(colL) + "\n";
+						finalPageText += formatLines(colR) + "\n";
+					} else {
+						// === 1-Spalten Modus ===
+						// Alles chronologisch rendern (formatLines sortiert nach Y)
+						finalPageText += formatLines(block) + "\n";
+					}
+				}
+	
+				return finalPageText;
+			};
+	
+			for (let pageNo = 1; pageNo <= pdf.numPages; pageNo++) {
+				const page = await pdf.getPage(pageNo);
+				const viewport = page.getViewport({ scale: 1.0 });
+				const content = await page.getTextContent();
+				
+				const items: PDFItem[] = (content.items as any[]).map((it) => ({
+					str: it.str,
+					x: it.transform[4],
+					y: it.transform[5],
+					w: it.width,
+					h: it.height || 10
+				})).filter(i => !isNoise(i));
+	
+				const pageText = processPageItems(items, viewport.width, viewport.height);
+				pagesText.push(pageText);
 			}
-			return out;
-		  };
-	  
-		  // --- Kern-Logik: Layout-Erkennung ---
-		  const processPageItems = (items: PDFItem[], pageWidth: number, pageHeight: number): string => {
-			  if (items.length === 0) return "";
-			  
-			  // 1. Footer/Header Erkennung (Heuristik)
-			  // Alles was extrem weit unten (Footer) oder oben (Header) ist, 
-			  // sollte separat behandelt werden, um Spaltenlogik nicht zu stören.
-			  const marginY = 50; // Bereich für Header/Footer
-			  const bodyItems = items.filter(i => i.y > marginY && i.y < (pageHeight - marginY));
-			  const footerItems = items.filter(i => i.y <= marginY);
-			  const headerItems = items.filter(i => i.y >= (pageHeight - marginY));
-	  
-			  // 2. Sortieren des Bodys: Wichtig! Von Oben nach Unten (Y absteigend)
-			  bodyItems.sort((a, b) => b.y - a.y);
-	  
-			  const midX = pageWidth / 2;
-			  // Toleranzbereich in der Mitte (Gutter), damit Texte die leicht überlappen nicht falsch zugeordnet werden
-			  const centerTolerance = pageWidth * 0.05; 
-	  
-			  let outputText = "";
-	  
-			  // Header zuerst
-			  if (headerItems.length > 0) outputText += formatLines(headerItems) + "\n\n";
-	  
-			  // 3. State Machine für Layout-Wechsel
-			  // Wir iterieren durch die Items und sammeln sie in Gruppen.
-			  // Sobald wir ein Item finden, das die Mitte kreuzt (1-Spaltig), 
-			  // verarbeiten wir den bisherigen 2-Spaltigen Buffer.
-			  
-			  let twoColBuffer: PDFItem[] = [];
-			  
-			  const flushTwoColBuffer = () => {
-				  if (twoColBuffer.length === 0) return;
-				  
-				  // Trenne Buffer in Links und Rechts
-				  const leftCol = twoColBuffer.filter(i => (i.x + i.w) < (midX + centerTolerance));
-				  const rightCol = twoColBuffer.filter(i => i.x > (midX - centerTolerance));
-				  
-				  // Sortiere und formatiere Spalten separat
-				  const leftText = formatLines(leftCol);
-				  const rightText = formatLines(rightCol);
-	  
-				  if (leftText) outputText += leftText + "\n";
-				  if (rightText) outputText += rightText + "\n";
-				  
-				  twoColBuffer = [];
-			  };
-	  
-			  for (const item of bodyItems) {
-				  // Prüfung: Kreuzt das Item die Mitte signifikant?
-				  // Ein Item ist "Wide" (1-spaltig), wenn es links beginnt und rechts endet
-				  const startsLeft = item.x < (midX - centerTolerance);
-				  const endsRight = (item.x + item.w) > (midX + centerTolerance);
-				  const isWideItem = startsLeft && endsRight;
-	  
-				  if (isWideItem) {
-					  // Layout-Wechsel erkannt! Erst den 2-Spalten Buffer leeren (Abarbeiten)
-					  flushTwoColBuffer();
-					  
-					  // Dann das breite Item direkt anfügen
-					  outputText += item.str + "\n"; 
-				  } else {
-					  // Das Item gehört zu einer Spalte -> ab in den Buffer
-					  twoColBuffer.push(item);
-				  }
-			  }
-	  
-			  // Restlichen Buffer leeren
-			  flushTwoColBuffer();
-	  
-			  // Footer zuletzt
-			  if (footerItems.length > 0) outputText += "\n\n" + formatLines(footerItems);
-	  
-			  return outputText;
-		  };
-	  
-	  
-		  for (let pageNo = 1; pageNo <= pdf.numPages; pageNo++) {
-			const page = await pdf.getPage(pageNo);
-			const viewport = page.getViewport({ scale: 1.0 });
-			const content = await page.getTextContent();
+	
+			const fullText = pagesText.join("\n\n-- PAGE BREAK --\n\n").trim();
 			
-			// Items mappen und bereinigen
-			let items: PDFItem[] = (content.items as any[]).map((it) => ({
-			  str: it.str,
-			  x: it.transform[4],
-			  y: it.transform[5],
-			  w: it.width,
-			  h: it.height || 10
-			})).filter(i => !isNoise(i));
-	  
-			const pageText = processPageItems(items, viewport.width, viewport.height);
-			pagesText.push(pageText);
-		  }
-	  
-		  const fullText = pagesText.join("\n\n-- PAGE BREAK --\n\n").trim();
-		  
-		  // Einfache Metadaten
-		  const yearMatch = fullText.match(/\b(19|20)\d{2}\b/);
-		  const metadata = { year: yearMatch ? yearMatch[0] : "" };
-	  
-		  return { text: fullText, metadata };
-	  
+			const yearMatch = fullText.match(/\b(19|20)\d{2}\b/);
+			const metadata = { year: yearMatch ? yearMatch[0] : "" };
+	
+			return { text: fullText, metadata };
+	
 		} catch (error) {
-		  console.error("PDF Extract Error:", error);
-		  return { text: "", metadata: {} };
+			console.error("PDF Extract Error:", error);
+			return { text: "", metadata: {} };
 		}
 	}			
 
