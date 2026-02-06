@@ -96,6 +96,7 @@ Enable Bachelor-Said → Switch to ON
 Reload Obsidian:
 
 -Open Command Palette → Strg+P
+
 -Run Command → Reload app without saving OR just close & reopen Obsidian
 
 ---
