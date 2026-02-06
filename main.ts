@@ -2235,61 +2235,59 @@ export default class BachelorSaidPlugin extends Plugin {
 		return null;
 	}
 	
-	/**
-     * Zerlegt einen Namen in Vorname (oder Initial) und Nachname.
-     * Erkennt "Otto, Boris" -> {first: "Boris", last: "Otto"}
-     * Erkennt "Boris Otto" -> {first: "Boris", last: "Otto"}
-     */
-    private parseName(rawName: string): { first: string; last: string } {
-        let clean = rawName.replace(/\./g, "").trim(); // Punkte entfernen (B. -> B)
+	private parseName(rawName: string): { first: string; last: string } {
+        // Bereinigung: Punkte weg, Trimmen, alles Kleinbuchstaben
+        let clean = rawName.replace(/\./g, "").trim().toLowerCase();
         
-        // Fall 1: "Nachname, Vorname" (Komma vorhanden)
+        // Doppelte Leerzeichen weg ("B  oris" -> "B oris")
+        clean = clean.replace(/\s+/g, " ");
+
+        // Fall 1: "Nachname, Vorname"
         if (clean.includes(",")) {
             const parts = clean.split(",").map(s => s.trim());
             return { 
-                last: parts[0].toLowerCase(), 
-                first: parts.length > 1 ? parts[1].toLowerCase() : "" 
+                last: parts[0], 
+                first: parts.length > 1 ? parts[1] : "" 
             };
         }
 
-        // Fall 2: "Vorname Nachname" (Kein Komma, letztes Wort ist Nachname)
+        // Fall 2: "Vorname Nachname"
         const parts = clean.split(" ");
         if (parts.length === 1) {
-            return { last: parts[0].toLowerCase(), first: "" };
+            return { last: parts[0], first: "" };
         }
         
-        const last = parts.pop()!.toLowerCase();
-        const first = parts.join(" ").toLowerCase();
+        const last = parts.pop()!; 
+        const first = parts.join(" "); 
         return { last, first };
     }
 
 	private async findExistingAuthorFile(nameToFind: string): Promise<TFile | null> {
+        // Such-Name parsen
         const target = this.parseName(nameToFind);
         if (!target.last) return null;
 
-        // Alle Dateien im People-Ordner holen
-        // (Achtung: Ersetze 'this.PEOPLE_DIR' durch deine Variable für den Autoren-Ordner)
         const files = this.app.vault.getMarkdownFiles().filter(f => 
             f.path.startsWith(this.PERSONS_DIR)
         );
 
         for (const file of files) {
-            // Wir parsen den Dateinamen der existierenden Notiz
-            const existingName = this.parseName(file.basename);
+            // TRICK: Wir wenden den Normalize auch auf den existierenden Dateinamen an.
+            // So wird aus einer alten Datei "B [oris] Otto.md" intern "Boris Otto" für den Vergleich.
+            const cleanBasename = this.normalizeAuthorName(file.basename);
+            const existingName = this.parseName(cleanBasename);
 
-            // 1. Check: Nachnamen müssen übereinstimmen
+            // 1. Nachnamen-Check
             if (existingName.last !== target.last) continue;
 
-            // 2. Check: Vornamen Match-Logik
-            const f1 = target.first;      // z.B. "b" (von Otto, B.)
-            const f2 = existingName.first; // z.B. "boris" (von Boris Otto)
+            // 2. Vornamen-Check
+            const f1 = target.first;      // Input (z.B. "b")
+            const f2 = existingName.first; // Existierend (z.B. "boris")
 
-            // Wenn einer gar keinen Vornamen hat -> Wir nehmen an, es ist dieselbe Person (vorsichtig)
+            // Wenn einer keinen Vornamen hat -> Match (kann ge-merged werden)
             if (!f1 || !f2) return file;
 
-            // Prüfen, ob einer der Vornamen mit dem anderen beginnt (Initial-Check)
-            // "boris".startsWith("b") -> TRUE
-            // "b".startsWith("boris") -> FALSE (aber wir checken beide Richtungen)
+            // Initialen-Match (in beide Richtungen)
             if (f1.startsWith(f2) || f2.startsWith(f1)) {
                 return file;
             }
@@ -2321,43 +2319,85 @@ export default class BachelorSaidPlugin extends Plugin {
 		return clean;
 	}
 
+	private isMoreCompleteName(newName: string, oldFileName: string): boolean {
+        const n = this.parseName(newName);
+        const o = this.parseName(oldFileName);
+
+        // Nachnamen müssen übereinstimmen
+        if (n.last !== o.last) return false;
+
+        if (!o.first && n.first) return true;
+
+        if (o.first && n.first) {
+            if (n.first.length > o.first.length && n.first.startsWith(o.first)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
 	async upsertPersonNote(rawName: string, sourcePaperTitle: string) {
         const cleanName = this.normalizeAuthorName(rawName);
         if (!cleanName) return;
 
-        // 1. Suche nach existierender Datei (Intelligent)
+        // 1. Existierende Datei suchen
         let file = await this.findExistingAuthorFile(cleanName);
 
         // Ordner sicherstellen
         await this.ensureFolder(this.PERSONS_DIR);
 
+        // --- NEU: UPGRADE LOGIK (Rename) ---
         if (file) {
-            // OPTIONALES FEATURE: Automatisches Umbenennen zu besserem Namen
-            // Wenn die Datei "Otto, B." heißt, aber wir jetzt "Boris Otto" haben -> Umbenennen!
-            const currentParse = this.parseName(file.basename);
-            const newParse = this.parseName(cleanName);
-            
-            // Wenn der neue Vorname länger ist als der alte (B. vs Boris), benennen wir um
-            if (newParse.first.length > currentParse.first.length && newParse.last === currentParse.last) {
-                const newPath = `${this.PERSONS_DIR}/${this.sanitizeFileName(cleanName)}.md`;
-                // Prüfen ob Zielpfad frei ist (sicherheitshalber)
-                if (!this.app.vault.getAbstractFileByPath(newPath)) {
+            // Prüfen, ob der neue Name (cleanName) besser ist als der Dateiname (file.basename)
+            if (this.isMoreCompleteName(cleanName, file.basename)) {
+                console.log(`[Person] Upgrading name: '${file.basename}' -> '${cleanName}'`);
+                
+                // Neuen Dateinamen bauen
+                const parsed = this.parseName(cleanName);
+                const formatCap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+                // Vornamen können mehrere Teile haben ("Jan Phillip")
+                const niceFirst = parsed.first.split(" ").map(s => formatCap(s)).join(" ");
+                const niceLast = formatCap(parsed.last);
+                const niceFileName = niceFirst ? `${niceFirst} ${niceLast}` : niceLast;
+
+                let safeFileName = this.sanitizeFileName(niceFileName);
+                if (safeFileName.endsWith(".")) safeFileName = safeFileName.slice(0, -1);
+                const newPath = `${this.PERSONS_DIR}/${safeFileName}.md`;
+
+                // Prüfen, ob Zieldatei schon existiert (Collision Check)
+                const collision = this.app.vault.getAbstractFileByPath(newPath);
+                
+                if (!collision) {
+                    // A) Umbenennen der Datei (Obsidian updated automatisch alle Backlinks!)
                     await this.app.fileManager.renameFile(file, newPath);
-                    file = this.app.vault.getAbstractFileByPath(newPath) as TFile;
-                    new Notice(`Renamed author to more complete name: ${file.basename}`);
+                    
+                    // B) Inhalt aktualisieren (H1 Titel ändern)
+                    // Wir lesen den Inhalt neu, da das File-Objekt durch rename evtl. intern aktualisiert wurde
+                    const text = await this.app.vault.read(file);
+                    // Ersetze "# Alter Name" durch "# Neuer Name"
+                    // Wir suchen nach der ersten Überschrift
+                    const newContent = text.replace(/^#\s+.*$/m, `# ${niceFileName}`);
+                    await this.app.vault.modify(file, newContent);
+                    
+                    new Notice(`Updated author: ${file.basename}`);
                 }
             }
-        } else {
-            // 2. Wenn nicht gefunden -> Neue Datei erstellen
-            // Wir bevorzugen das Format "Vorname Nachname" für den Dateinamen
-            // Falls der Input "Otto, B." war, drehen wir es hier um für den Dateinamen
+        }
+        // ----------------------------------
+
+        if (!file) {
+            // 2. Wenn NICHT gefunden (auch nicht nach Upgrade-Check) -> Neue Datei erstellen
             const parsed = this.parseName(cleanName);
-            const fileNameStr = parsed.first ? `${parsed.first} ${parsed.last}` : parsed.last;
+            const formatCap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+            const niceFirst = parsed.first.split(" ").map(s => formatCap(s)).join(" ");
+            const niceLast = formatCap(parsed.last);
+            const fileNameStr = niceFirst ? `${niceFirst} ${niceLast}` : niceLast;
             
-            // Wörter großschreiben (Title Case) für schönen Dateinamen
-            const niceFileName = fileNameStr.replace(/\b\w/g, l => l.toUpperCase());
+            let safeFileName = this.sanitizeFileName(fileNameStr);
+            if (safeFileName.endsWith(".")) safeFileName = safeFileName.slice(0, -1);
             
-            const path = `${this.PERSONS_DIR}/${this.sanitizeFileName(niceFileName)}.md`;
+            const path = `${this.PERSONS_DIR}/${safeFileName}.md`;
             
             const content = 
 `---
@@ -2367,19 +2407,35 @@ tags:
 date: ${new Date().toISOString().slice(0, 10)}
 ---
 
-# ${niceFileName}
+# ${fileNameStr}
 
 ## Associated Papers
 `;
-            file = await this.app.vault.create(path, content);
+            try {
+                file = await this.app.vault.create(path, content);
+            } catch (e) {
+                file = this.app.vault.getAbstractFileByPath(path) as TFile;
+            }
         }
 
-        // 3. Backlink zum Paper hinzufügen (Append)
-        // Wir prüfen, ob das Paper schon in der Notiz steht, um Duplikate im Text zu vermeiden
-        const content = await this.app.vault.read(file);
-        const linkText = `[[${sourcePaperTitle}]]`;
+        if (!file) return;
+
+        // 3. Backlink zum Paper hinzufügen
+        let linkTarget = "";
+        const existingPaper = await this.findExistingPaperNote(sourcePaperTitle);
         
-        if (!content.includes(linkText)) {
+        if (existingPaper) {
+            linkTarget = existingPaper.basename;
+        } else {
+            let safeTitle = this.sanitizeFileName(sourcePaperTitle);
+            if (safeTitle.endsWith(".")) safeTitle = safeTitle.slice(0, -1);
+            linkTarget = safeTitle;
+        }
+
+        const linkText = `[[${linkTarget}]]`;
+        const contentText = await this.app.vault.read(file);
+        
+        if (!contentText.includes(linkText)) {
             await this.app.vault.append(file, `\n- ${linkText}`);
         }
     }
@@ -2542,70 +2598,156 @@ JSON OUTPUT:`;
 		return results;
 	}
 	
-	private async upsertCitedPaperNote(meta: {
-		title?: string; authors?: string[]; year?: string; venue?: string;
-	}) {
-		const rawTitle = (meta.title ?? "").trim();
-		// Filter: Titel zu kurz oder sieht aus wie ein Autor?
-		if (!rawTitle || rawTitle.length < 10) return;
-		if (rawTitle.split(" ").length < 3 && rawTitle.includes(",")) return; // Schutz vor "Müller, T." als Titel
+	private getCanonicalName(name: string): string {
+        return name
+            .toLowerCase()
+            .replace(/[.,;]/g, " ") // Punkte und Kommas zu Leerzeichen
+            .replace(/\s+/g, " ")   // Mehrfach-Leerzeichen weg
+            .trim();
+    }
 
-		// 1. Suche nach existierender Notiz
-		const existingNote = await this.findExistingPaperNote(rawTitle);
-		if (existingNote) {
-			console.log(`Reference already exists: ${existingNote.path}`);
-			return; // Nichts tun, wenn es schon existiert
-		}
+    /**
+     * Sucht extrem robust nach einer existierenden Autoren-Datei.
+     * Prüft "Vorname Nachname" UND "Nachname Vorname".
+     */
+    private findAuthorFileByName(rawName: string): TFile | null {
+        const canonicalInput = this.getCanonicalName(rawName);
+        if (canonicalInput.length < 2) return null;
 
-		await this.ensureFolder(this.QUELLEN_DIR);
+        // Alle existierenden Personen-Dateien laden
+        const personFiles = this.app.vault.getMarkdownFiles().filter(f => f.path.startsWith(this.PERSONS_DIR));
 
-		// Dateiname bereinigen
-		const baseName = this.sanitizeFileName(rawTitle);
-		const path = `${this.QUELLEN_DIR}/${baseName}.md`;
+        for (const file of personFiles) {
+            const fileCanonical = this.getCanonicalName(file.basename);
 
-		// Metadaten vorbereiten
-		const createdDate = new Date().toISOString().slice(0, 10);
-		
-		// Wikilinks formatieren
-		const authorLinks = Array.isArray(meta.authors) 
-			? meta.authors.map(a => `[[${this.normalizeAuthorName(a)}]]`) 
-			: [];
-		const venueLink = meta.venue ? `[[${meta.venue.replace(/"/g, "'")}]]` : "";
-		const titleLink = `[[${rawTitle.replace(/"/g, "'")}]]`;
+            // 1. Direkter Match ("b palani" == "b palani")
+            if (fileCanonical === canonicalInput) return file;
 
-		// YAML Frontmatter manuell bauen für maximale Kontrolle (analog zu handleDroppedPDF)
-		const yamlFrontmatter = [
-			"---",
-			`title: "${titleLink}"`,
-			`date: ${createdDate}`,
-			"author:",
-			...authorLinks.map(a => `  - "${a.replace(/"/g, "'")}"`),
-			...(venueLink ? [`conference: "${venueLink}"`] : []),
-			`year: ${meta.year || "Unknown"}`,
-			"tags:",
-			"  - type/paper",
-			"  - source/reference", // Unterscheidung: Dies ist eine importierte Referenz
-			"  - status/toread",
-			"---",
-			"",
-			`# ${rawTitle}`,
-			"",
-			"## Summary",
-			"_Automatically extracted reference from a parent PDF._",
-			""
-		].join("\n");
+            // 2. Tausch-Match (für "Nachname, Vorname" vs "Vorname Nachname")
+            // Wir drehen den Dateinamen um und schauen, ob er dann passt
+            const parts = fileCanonical.split(" ");
+            if (parts.length > 1) {
+                const swapped = parts.reverse().join(" "); // "palani b"
+                if (swapped === canonicalInput) return file;
+            }
+            
+            // 3. Enthält-Match (Vorsichtig!)
+            // Wenn Input "B. Palani" ist und Datei "Dr. B. Palani"
+            if (fileCanonical.includes(canonicalInput) || canonicalInput.includes(fileCanonical)) {
+                 // Nur matchen, wenn die Längen sich nicht zu stark unterscheiden (vermeidet falsche Matches bei kurzen Namen)
+                 if (Math.abs(fileCanonical.length - canonicalInput.length) < 4) {
+                     return file;
+                 }
+            }
+        }
+        return null;
+    }
 
-		// Datei erstellen
-		await this.app.vault.create(path, yamlFrontmatter);
-		
-		// Optional: Auch für diese Autoren Person-Notes anlegen
-		if (meta.authors) {
-			for (const authorName of meta.authors) {
-				const normName = this.normalizeAuthorName(authorName);
-				if (normName) await this.upsertPersonNote(normName, rawTitle);
-			}
-		}
-	}
+    private async upsertCitedPaperNote(meta: {
+        title?: string; authors?: string[]; year?: string; venue?: string;
+    }) {
+        let rawTitle = (meta.title ?? "").trim();
+        const splitMatch = rawTitle.match(/^(.{2,60}?)(?:\s*[:–-]\s*)(.*)$/);
+        
+        if (splitMatch) {
+            const prefix = splitMatch[1]; // "Otto, B."
+            const suffix = splitMatch[2]; // "Data Spaces"
+            
+            // Wir prüfen: Kommt der "Prefix" (z.B. Otto) in der Autorenliste vor?
+            if (meta.authors && meta.authors.some(a => prefix.toLowerCase().includes(this.parseName(a).last))) {
+                console.log(`[Reference Clean] Stripped author prefix '${prefix}' from title.`);
+                rawTitle = suffix.trim();
+            }
+        }
+
+        if (!rawTitle || rawTitle.length < 5) return;
+        
+        if (rawTitle.length < 30 && rawTitle.includes(",") && rawTitle.split(" ").length < 4) {
+            return; 
+        }
+
+        // 1. Suche nach existierender Notiz (Paper)
+        const existingNote = await this.findExistingPaperNote(rawTitle);
+        if (existingNote) {
+            console.log(`Reference already exists: ${existingNote.path}`);
+            return; 
+        }
+
+        await this.ensureFolder(this.QUELLEN_DIR);
+
+        // Dateiname bereinigen
+        let baseName = this.sanitizeFileName(rawTitle);
+        if (baseName.endsWith(".")) baseName = baseName.slice(0, -1);
+        
+        const path = `${this.QUELLEN_DIR}/${baseName}.md`;
+
+        // Metadaten vorbereiten
+        const createdDate = new Date().toISOString().slice(0, 10);
+        
+        // --- AUTOREN CLEANUP & SMART LINKING (Wie zuvor besprochen) ---
+        const uniqueAuthorLinks = new Set<string>();
+
+        if (Array.isArray(meta.authors)) {
+            for (const author of meta.authors) {
+                let cleanName = this.normalizeAuthorName(author);
+                if (!cleanName) continue;
+
+                const existingPersonFile = await this.findExistingAuthorFile(cleanName);
+
+                if (existingPersonFile) {
+                    uniqueAuthorLinks.add(`[[${existingPersonFile.basename}]]`);
+                } else {
+                    const parsed = this.parseName(cleanName);
+                    const niceName = (parsed.first ? `${parsed.first} ${parsed.last}` : parsed.last)
+                        .replace(/\./g, "") 
+                        .replace(/\b\w/g, l => l.toUpperCase());
+
+                    uniqueAuthorLinks.add(`[[${niceName}]]`);
+                }
+            }
+        }
+
+        const venueLink = meta.venue ? `[[${meta.venue.replace(/"/g, "'")}]]` : "";
+        const titleLink = `[[${rawTitle.replace(/"/g, "'")}]]`;
+
+        // YAML Bauen
+        const yamlFrontmatter = [
+            "---",
+            `title: "${titleLink}"`,
+            `date: ${createdDate}`,
+            "author:",
+            ...Array.from(uniqueAuthorLinks).map(link => `  - "${link}"`),
+            ...(venueLink ? [`conference: "${venueLink}"`] : []),
+            `year: ${meta.year || "Unknown"}`,
+            "tags:",
+            "  - type/paper",
+            "  - source/reference",
+            "  - status/toread",
+            "---",
+            "",
+            `# ${rawTitle}`,
+            "",
+            "## Summary",
+            "_Automatically extracted reference from a parent PDF._",
+            ""
+        ].join("\n");
+
+        // Datei erstellen
+        try {
+             await this.app.vault.create(path, yamlFrontmatter);
+        } catch (e) {
+            console.warn("Could not create reference note:", path, e);
+            // new Notice(`Error creating reference note: ${baseName}`);
+            return;
+        }
+        
+        // Person-Notes anlegen für die neuen Links
+        for (const link of Array.from(uniqueAuthorLinks)) {
+            const nameFromLink = link.replace(/^\[\[|\]\]$/g, "");
+            // Hier übergeben wir den bereinigten "rawTitle" als Source
+            await this.upsertPersonNote(nameFromLink, rawTitle);
+        }
+    }
 
 	async handleDroppedPDF(file: File) {
 		const loadingModal = new DragAndDropModal(this.app, `<i>Loading PDF and extracting metadata...</i>`);
@@ -2614,7 +2756,6 @@ JSON OUTPUT:`;
 			loadingModal.open();
 	
 			const fileBuffer = await file.arrayBuffer();
-			// WICHTIG: Buffer kopieren, da manche Operationen ihn "verbrauchen"
 			const metadataBuffer = fileBuffer.slice(0);
 			const binaryBuffer = fileBuffer.slice(0);
 			
@@ -2622,7 +2763,7 @@ JSON OUTPUT:`;
 	
 			const title = file.name.replace(/\.pdf$/i, "").trim();
 			const cleanedText = await this.preCleanText(pdfText);
-			const firstChunk = cleanedText.slice(0, 8000); // For metadata
+			const firstChunk = cleanedText.slice(0, 8000); 
 	
 			// === Step 1: Metadata Extraction ===
 			const llamaPrompt = `Extract the following metadata from this academic paper content. ONLY return in this format:
@@ -2644,7 +2785,6 @@ JSON OUTPUT:`;
 			const emailsMatch = content.match(/Emails:\s*(.*)/i);
 			let emails = emailsMatch ? emailsMatch[1].split(/[,;]/).map(e => e.trim()).filter(Boolean) : [];
 
-			// fallback: regex-scan im firstChunk (sehr zuverlässig bei PDFs)
 			if (!emails.length) emails = this.extractEmails(firstChunk);
 	
 			const authors = authorsMatch ? authorsMatch[1].split(/,| and /).map(a => a.trim()) : ["Unknown Author"];
@@ -2661,10 +2801,7 @@ JSON OUTPUT:`;
 					? pdfInternalMetadata.year
 					: "Unknown Year";
 	
-			// === Vorbereitung der Daten ===
 			const createdDate = new Date().toISOString().slice(0, 10);
-
-			// Optional: als Wikilinks anzeigen (wie im Properties-UI als klickbare Chips)
 			const titleLink = `[[${title.replace(/"/g, "'")}]]`;
 			const authorLinks = finalAuthors.map(a => `[[${a}]]`);
 			const conferenceLink = `[[${conferenceOrJournal.replace(/"/g, "'")}]]`;
@@ -2690,7 +2827,7 @@ JSON OUTPUT:`;
 				"  - status/imported",
 				`template_version: "1.0"`,
 				"---",
-				"" // Leerzeile nach Frontmatter
+				"" 
 			].join("\n");
 	
 			// === Step 2: Summarize in Chunks ===
@@ -2715,7 +2852,6 @@ JSON OUTPUT:`;
 				summaries.push(chunkResponse.message.content.trim());
 			}
 	
-			// === Final Summary Consolidation ===
 			loadingModal.updateContent(`<i>Consolidating summaries into a final paragraph...</i>`);
 			const consolidatePrompt = `You are given several partial summaries from chunks of an academic paper. Combine them into one concise, cohesive summary paragraph.
 			
@@ -2726,23 +2862,45 @@ JSON OUTPUT:`;
 			const finalSummaryResponse = await this.processWithLlama3(consolidatePrompt);
 			const finalSummary = finalSummaryResponse.message.content.trim();
 			
-			// === ZITATE & REFERENZEN EXTRAHIEREN (SAFE MODE) ===
-			// Hier fangen wir Fehler ab, damit der Haupt-Import nicht abbricht
+			// === ZITATE & REFERENZEN EXTRAHIEREN (MIT LINK GENERIERUNG) ===
+			
+            // Array zum Sammeln der Links für den Full Text Bereich
+            let extractedReferenceLinks: string[] = [];
+
 			try {
 				const refBlockRaw = this.extractReferencesBlock(cleanedText);
 				
 				if (refBlockRaw.length > 0 && refBlockRaw[0].length > 100) {
 					loadingModal.updateContent(`<i>🔍 Found references. Analyzing...</i>`);
 					
-					// LLM Aufruf zum Parsen
 					const extractedRefs = await this.extractStructuredReferences(refBlockRaw[0]);
 					
 					let createdCount = 0;
 					for (const ref of extractedRefs) {
 						if (ref.isAcademic) {
-							// Einzelne Fehler bei Referenzen ignorieren wir
+							// 1. Notiz in 04_quellen erstellen (oder ignorieren wenn existiert)
 							await this.upsertCitedPaperNote(ref).catch(e => console.warn("Ref error", e));
 							createdCount++;
+
+                            // 2. Link generieren für den Footer
+                            const refTitle = (ref.title ?? "").trim();
+                            if (refTitle && refTitle.length > 10) {
+                                // Logik: Prüfen ob in 01_papers (Upgrade) oder 04_quellen
+                                let targetBasename = "";
+                                
+                                const existingPaper = await this.findExistingPaperNote(refTitle);
+                                if (existingPaper) {
+                                    // Ziel: 01_papers (oder bereits existierende Quelle)
+                                    targetBasename = existingPaper.basename;
+                                } else {
+                                    // Ziel: 04_quellen (Name berechnen wie in upsertCitedPaperNote)
+                                    let safeBase = this.sanitizeFileName(refTitle);
+                                    if (safeBase.endsWith(".")) safeBase = safeBase.slice(0, -1);
+                                    targetBasename = safeBase;
+                                }
+                                
+                                extractedReferenceLinks.push(`- [[${targetBasename}]]`);
+                            }
 						}
 					}
 					console.log(`Created ${createdCount} new notes from references.`);
@@ -2752,24 +2910,29 @@ JSON OUTPUT:`;
 				new Notice("Skipped reference extraction due to AI error.");
 			}
 
-			// === Save PDF to Vault (SAFE MODE) ===
+			// === Save PDF to Vault ===
 			const pdfFolder = "pdf";
 			if (!this.app.vault.getAbstractFileByPath(pdfFolder)) {
 				await this.app.vault.createFolder(pdfFolder).catch(() => {});
 			}
 	
 			const pdfFileName = `${pdfFolder}/${file.name}`;
-			
-			// Prüfen ob Datei existiert, BEVOR wir schreiben
 			if (!this.app.vault.getAbstractFileByPath(pdfFileName)) {
 				await this.app.vault.createBinary(pdfFileName, binaryBuffer);
-			} else {
-				new Notice(`PDF file already exists, linking to existing one.`);
 			}
 	
 			const pdfEmbed = `![[${pdfFileName}]]`;
 	
-			// === Final Note Body ===
+			// === Final Note Body Construct ===
+            
+            // Referenzen-Block bauen (nur wenn Links vorhanden)
+            let referenceSection = "";
+            if (extractedReferenceLinks.length > 0) {
+                // Duplikate entfernen und sortieren
+                const uniqueLinks = [...new Set(extractedReferenceLinks)].sort();
+                referenceSection = `\n${uniqueLinks.join("\n")}`;
+            }
+
 			const noteBody =
 			yamlFrontmatter +
 			`## Summary
@@ -2777,6 +2940,9 @@ ${finalSummary}
 
 ## Full Text Extracted from PDF
 ${cleanedText}
+
+## Extracted References
+${referenceSection}
 
 ## PDF Viewer
 ${pdfEmbed}
@@ -2791,25 +2957,19 @@ ${pdfEmbed}
 				const isInPapers = existingNote.path.startsWith(this.PAPERS_DIR);
 
 				if (isInPapers) {
-					// FALL A: Existiert schon fertig
 					new Notice("Paper already exists in library.");
 					finalFile = existingNote;
 				} 
 				else if (isInQuellen) {
-					// FALL B: Upgrade Reference -> Paper
 					loadingModal.updateContent(`<i>Found reference. Upgrading to full paper...</i>`);
 					const newPath = `${this.PAPERS_DIR}/${existingNote.name}`;
 					
-					// Prüfen, ob das Ziel für das Verschieben frei ist
 					if (this.app.vault.getAbstractFileByPath(newPath)) {
-						// Ziel belegt -> Wir bleiben im Quellen-Ordner, aber aktualisieren den Inhalt
 						new Notice("Target filename busy. Updating existing reference note instead.");
 						await this.app.vault.modify(existingNote, noteBody);
 						finalFile = existingNote;
 					} else {
-						// Ziel frei -> Verschieben und Aktualisieren
 						await this.app.fileManager.renameFile(existingNote, newPath);
-						// Kurz warten für Dateisystem
 						await new Promise(r => setTimeout(r, 100));
 						await this.app.vault.modify(existingNote, noteBody);
 						finalFile = existingNote;
@@ -2822,28 +2982,26 @@ ${pdfEmbed}
 			} else {
 				// FALL C: Neue Datei erstellen
 				await this.ensureFolder(this.PAPERS_DIR);
-				const safeTitle = this.sanitizeFileName(title);
+				let safeTitle = this.sanitizeFileName(title);
+                if (safeTitle.endsWith(".")) safeTitle = safeTitle.slice(0, -1);
+                
 				let noteFileName = `${this.PAPERS_DIR}/${safeTitle}.md`;
 				
-				// Namenskollision verhindern (z.B. gleiche Datei aber findExistingPaperNote hat sie übersehen)
 				if (this.app.vault.getAbstractFileByPath(noteFileName)) {
 					noteFileName = `${this.PAPERS_DIR}/${safeTitle} (1).md`;
-					new Notice("Filename existed. Created with suffix (1).");
 				}
 
-				// Finaler Check vor dem Erstellen
 				if (!this.app.vault.getAbstractFileByPath(noteFileName)) {
 					finalFile = await this.app.vault.create(noteFileName, noteBody);
 					new Notice(`Imported new paper: ${title}`);
 				} else {
-					// Sollte nicht passieren, aber sicher ist sicher
 					new Notice("Error: Could not create file (duplicate name).");
 					loadingModal.close();
 					return;
 				}
 			}
 
-			// ✅ Person & Conference Notes aktualisieren
+			// Person & Conference Notes aktualisieren
 			for (const a of finalAuthors) {
 				if (a && a !== "Unknown Author") {
 					await this.upsertPersonNote(a, title);
@@ -2868,30 +3026,24 @@ ${pdfEmbed}
 				new Notice("Failed to process PDF: " + msg.slice(0, 100));
 			}
 			console.error("Error processing dropped PDF:", error);
-			
-			// Versuchen das Modal zu schließen, falls es noch offen ist
-			try {
-				const modals = document.querySelectorAll('.modal-container');
-				modals.forEach(m => m.remove());
-			} catch(e) {}
+			try { document.querySelectorAll('.modal-container').forEach(m => m.remove()); } catch(e) {}
 		}
 	}
 
 	private normalizeAuthorName(raw: string): string {
-		let s = (raw ?? "").trim();
-	  
-		// drop emails and affiliation-like tails
-		s = s.replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[A-Za-z]{2,}/g, "").trim();
-		s = s.replace(/\b(university|institute|department|lab|laboratory|gmbh|inc\.|ltd\.|company)\b.*$/i, "").trim();
-	  
-		// remove trailing punctuation
-		s = s.replace(/[.,;:]+$/g, "").trim();
-	  
-		// very short / garbage
-		if (s.length < 3) return "";
-	  
-		return s;
-	}	  
+        let s = (raw ?? "").trim();
+      
+        s = s.replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[A-Za-z]{2,}/g, "").trim();
+        s = s.replace(/\b(university|institute|department|lab|laboratory|gmbh|inc\.|ltd\.|company)\b.*$/i, "").trim();
+      
+        s = s.replace(/[\[\]\(\)]/g, ""); 
+      
+        s = s.replace(/[.,;:]+$/g, "").trim();
+      
+        if (s.length < 2) return "";
+      
+        return s;
+    }	  
 	
 	async addRelevanceAnalysisButton(noteFile: TFile) {
 		const noteText = await this.app.vault.read(noteFile);

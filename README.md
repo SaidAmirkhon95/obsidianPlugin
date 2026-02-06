@@ -70,11 +70,15 @@ npm -v
 ---
 
 cd bachelor-said
-npm install
+
+`npm install`
 
 Replace Rows:
+
 69   openaiApiKey: "",
+
 70   groqApiKey: "",
+
 With separate provided keys!
 
 ---> npm run build <--- This generates the compiled plugin files used by Obsidian.
@@ -87,11 +91,13 @@ Open Obsidian:
 
 Go to Settings → Community Plugins
 
-Enable Bachelor-Said -> Switch to ON
+Enable Bachelor-Said → Switch to ON
 
 Reload Obsidian:
 
-Command Palette → Reload app without saving or close & reopen Obsidian
+-Open Command Palette → Strg+P
+
+-Run Command → Reload app without saving OR just close & reopen Obsidian
 
 ---
 
@@ -101,10 +107,10 @@ After reload, you should see a 🗨️ message-square icon in the left sidebar.
 
 ---
 
-How to Use
-Import PDF papers
+## How to Use
 
-Drag & drop PDF files into any empty space in Obsidian
+-Import PDF papers
+-Drag & drop PDF files into any empty space in Obsidian
 
 The plugin will automatically:
 
