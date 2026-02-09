@@ -122,6 +122,7 @@ export class ChatView extends ItemView {
 		const parts = inner.split("|");
 		return (parts[parts.length - 1] ?? inner).replace(/^"+|"+$/g, "").trim();
 	}
+	private subtitleEl!: HTMLElement;
 
 	constructor(leaf: WorkspaceLeaf, private plugin: BachelorSaidPlugin) {
 		super(leaf);
@@ -512,11 +513,38 @@ export class ChatView extends ItemView {
 			await send();
 		  }
 		});
+
+		// Wir speichern die Referenz in this.subtitleEl, um sie später zu updaten
+        this.subtitleEl = titleWrap.createEl('div', { text: 'No active note' });
+        Object.assign(this.subtitleEl.style, {
+            fontSize: '11px',
+            opacity: '0.75',
+            marginTop: '2px',
+            color: 'var(--text-accent)' // Optional: Farbe für bessere Sichtbarkeit
+        });
+
+        // Event Listener: Wenn man die Notiz wechselt, update den Titel im Chat
+        this.registerEvent(this.app.workspace.on('active-leaf-change', () => {
+            this.updateActiveNoteHeader();
+        }));
+        
+        // Initialer Aufruf
+        this.updateActiveNoteHeader();
 	  
 		sendBtn.onclick = () => send();
 	  
 		this.renderMessages();
 	}
+
+	private updateActiveNoteHeader() {
+        const file = this.app.workspace.getActiveFile();
+        if (file) {
+            this.subtitleEl.setText(file.basename);
+            this.subtitleEl.setAttr('title', file.path); // Tooltip mit Pfad
+        } else {
+            this.subtitleEl.setText("No active note");
+        }
+    }
 
 	private renderMessages() {
 		this.chatContainer.empty();
@@ -2337,26 +2365,60 @@ export default class BachelorSaidPlugin extends Plugin {
         return false;
     }
 
-	async upsertPersonNote(rawName: string, sourcePaperTitle: string) {
+    getLevenshteinDistance(a: string, b: string): number {
+        const matrix = [];
+        let i, j;
+
+        if (a.length === 0) return b.length;
+        if (b.length === 0) return a.length;
+
+        for (i = 0; i <= b.length; i++) { matrix[i] = [i]; }
+        for (j = 0; j <= a.length; j++) { matrix[0][j] = j; }
+
+        for (i = 1; i <= b.length; i++) {
+            for (j = 1; j <= a.length; j++) {
+                if (b.charAt(i - 1) == a.charAt(j - 1)) {
+                    matrix[i][j] = matrix[i - 1][j - 1];
+                } else {
+                    matrix[i][j] = Math.min(
+                        matrix[i - 1][j - 1] + 1, // substitution
+                        Math.min(
+                            matrix[i][j - 1] + 1, // insertion
+                            matrix[i - 1][j] + 1  // deletion
+                        )
+                    );
+                }
+            }
+        }
+        return matrix[b.length][a.length];
+    }
+
+    // Hilfsfunktion: Berechnet Ähnlichkeit in Prozent (0.0 bis 1.0) (SYNCHRON)
+    getSimilarity(s1: string, s2: string): number {
+        const longer = s1.length > s2.length ? s1 : s2;
+        if (longer.length === 0) return 1.0;
+        // Hier kein await mehr nötig
+        return (longer.length - this.getLevenshteinDistance(s1, s2)) / longer.length;
+    }
+
+    async upsertPersonNote(rawName: string, sourcePaperTitle: string) {
         const cleanName = this.normalizeAuthorName(rawName);
         if (!cleanName) return;
 
-        // 1. Existierende Datei suchen
+        const cleanPaperTitle = sourcePaperTitle.trim().replace(/[.,;:]+$/, "");
+
+        // 1. Existierende Autoren-Datei suchen
         let file = await this.findExistingAuthorFile(cleanName);
 
         // Ordner sicherstellen
         await this.ensureFolder(this.PERSONS_DIR);
 
-        // --- NEU: UPGRADE LOGIK (Rename) ---
         if (file) {
-            // Prüfen, ob der neue Name (cleanName) besser ist als der Dateiname (file.basename)
             if (this.isMoreCompleteName(cleanName, file.basename)) {
                 console.log(`[Person] Upgrading name: '${file.basename}' -> '${cleanName}'`);
                 
-                // Neuen Dateinamen bauen
                 const parsed = this.parseName(cleanName);
                 const formatCap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
-                // Vornamen können mehrere Teile haben ("Jan Phillip")
                 const niceFirst = parsed.first.split(" ").map(s => formatCap(s)).join(" ");
                 const niceLast = formatCap(parsed.last);
                 const niceFileName = niceFirst ? `${niceFirst} ${niceLast}` : niceLast;
@@ -2365,41 +2427,32 @@ export default class BachelorSaidPlugin extends Plugin {
                 if (safeFileName.endsWith(".")) safeFileName = safeFileName.slice(0, -1);
                 const newPath = `${this.PERSONS_DIR}/${safeFileName}.md`;
 
-                // Prüfen, ob Zieldatei schon existiert (Collision Check)
                 const collision = this.app.vault.getAbstractFileByPath(newPath);
                 
                 if (!collision) {
-                    // A) Umbenennen der Datei (Obsidian updated automatisch alle Backlinks!)
                     await this.app.fileManager.renameFile(file, newPath);
-                    
-                    // B) Inhalt aktualisieren (H1 Titel ändern)
-                    // Wir lesen den Inhalt neu, da das File-Objekt durch rename evtl. intern aktualisiert wurde
                     const text = await this.app.vault.read(file);
-                    // Ersetze "# Alter Name" durch "# Neuer Name"
-                    // Wir suchen nach der ersten Überschrift
                     const newContent = text.replace(/^#\s+.*$/m, `# ${niceFileName}`);
                     await this.app.vault.modify(file, newContent);
-                    
                     new Notice(`Updated author: ${file.basename}`);
                 }
             }
         }
-        // ----------------------------------
 
+        // Wenn File noch nicht existiert, neu anlegen
         if (!file) {
-            // 2. Wenn NICHT gefunden (auch nicht nach Upgrade-Check) -> Neue Datei erstellen
-            const parsed = this.parseName(cleanName);
-            const formatCap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
-            const niceFirst = parsed.first.split(" ").map(s => formatCap(s)).join(" ");
-            const niceLast = formatCap(parsed.last);
-            const fileNameStr = niceFirst ? `${niceFirst} ${niceLast}` : niceLast;
-            
-            let safeFileName = this.sanitizeFileName(fileNameStr);
-            if (safeFileName.endsWith(".")) safeFileName = safeFileName.slice(0, -1);
-            
-            const path = `${this.PERSONS_DIR}/${safeFileName}.md`;
-            
-            const content = 
+             const parsed = this.parseName(cleanName);
+             const formatCap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+             const niceFirst = parsed.first.split(" ").map(s => formatCap(s)).join(" ");
+             const niceLast = formatCap(parsed.last);
+             const fileNameStr = niceFirst ? `${niceFirst} ${niceLast}` : niceLast;
+             
+             let safeFileName = this.sanitizeFileName(fileNameStr);
+             if (safeFileName.endsWith(".")) safeFileName = safeFileName.slice(0, -1);
+             
+             const path = `${this.PERSONS_DIR}/${safeFileName}.md`;
+             
+             const content = 
 `---
 tags:
   - type/person
@@ -2419,24 +2472,68 @@ date: ${new Date().toISOString().slice(0, 10)}
         }
 
         if (!file) return;
-
-        // 3. Backlink zum Paper hinzufügen
+        
         let linkTarget = "";
-        const existingPaper = await this.findExistingPaperNote(sourcePaperTitle);
+        
+        const existingPaper = await this.findExistingPaperNote(cleanPaperTitle);
         
         if (existingPaper) {
             linkTarget = existingPaper.basename;
         } else {
-            let safeTitle = this.sanitizeFileName(sourcePaperTitle);
+            let safeTitle = this.sanitizeFileName(cleanPaperTitle);
             if (safeTitle.endsWith(".")) safeTitle = safeTitle.slice(0, -1);
             linkTarget = safeTitle;
         }
 
-        const linkText = `[[${linkTarget}]]`;
-        const contentText = await this.app.vault.read(file);
+        const newLinkText = `[[${linkTarget}]]`;
         
-        if (!contentText.includes(linkText)) {
-            await this.app.vault.append(file, `\n- ${linkText}`);
+        // Datei lesen
+        let contentText = await this.app.vault.read(file);
+        
+        // --- NEUE LOGIK: Fuzzy Check ---
+        const lines = contentText.split("\n");
+        let duplicateFound = false;
+        let bestMatchIndex = -1;
+        let highestSim = 0.0;
+
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i].trim();
+            
+            // Prüfen ob es ein Wikilink ist
+            const match = line.match(/^-\s*\[\[(.+?)\]\]/);
+            if (match) {
+                const existingTitle = match[1].split("|")[0]; 
+
+                // 1. Exakter Match
+                if (existingTitle.toLowerCase() === linkTarget.toLowerCase()) {
+                    duplicateFound = true;
+                    break; 
+                }
+
+                // 2. Fuzzy Match
+                const sim = this.getSimilarity(existingTitle.toLowerCase(), linkTarget.toLowerCase());
+                
+                // Schwellenwert: 85% Ähnlichkeit
+                if (sim > 0.85 && sim > highestSim) { 
+                    duplicateFound = true;
+                    bestMatchIndex = i;
+                    highestSim = sim;
+                }
+            }
+        }
+
+        if (!duplicateFound) {
+            await this.app.vault.append(file, `\n- ${newLinkText}`);
+        } else if (bestMatchIndex !== -1 && highestSim > 0.85) {
+            // Wir haben ein Fuzzy-Duplikat gefunden!
+            const oldLine = lines[bestMatchIndex];
+            
+            if (!oldLine.includes(linkTarget)) {
+                lines[bestMatchIndex] = `- ${newLinkText}`;
+                const newContent = lines.join("\n");
+                await this.app.vault.modify(file, newContent);
+                console.log(`[Person] Fixed dirty link: '${oldLine}' -> '- ${newLinkText}'`);
+            }
         }
     }
 
