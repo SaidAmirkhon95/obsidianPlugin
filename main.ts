@@ -1,4 +1,4 @@
-import { App, MarkdownView,	Modal, Notice, Plugin, TFile } from 'obsidian';
+import { App, MarkdownView,	Modal, Notice, Plugin, TFile, PluginSettingTab, Setting } from 'obsidian';
 import { getDocument, GlobalWorkerOptions, PDFDocumentProxy } from 'pdfjs-dist';
 import * as yaml from "js-yaml";
 import { ItemView, WorkspaceLeaf } from 'obsidian';
@@ -63,9 +63,9 @@ const DEFAULT_SETTINGS: MyPluginSettings = {
 	mySetting: "default",
 	embeddingProvider: "ollama",
 	embeddingModel: "nomic-embed-text",
-	topK: 6,
-	chunkSize: 2000,
-	chunkOverlap: 250,
+	topK: 15,
+	chunkSize: 1500,
+	chunkOverlap: 300,
 	openaiApiKey: "",
 	groqApiKey: "",
 	modelChat: "llama-3.1-8b-instant",
@@ -999,7 +999,7 @@ export default class BachelorSaidPlugin extends Plugin {
 	settings: MyPluginSettings;
 
 	private ragIndex: RagIndex | null = null;
-  	private ragIndexPath: string | null = null;
+  	public ragIndexPath: string | null = null;
 
 	private logPreview(label: string, text: string, max = 400) {
 		const t = (text ?? "").toString();
@@ -1171,7 +1171,9 @@ export default class BachelorSaidPlugin extends Plugin {
 					if (file) await this.runRelevanceAnalysis(file);
 				});
 			});
-		});		
+		});
+
+		this.addSettingTab(new BachelorSaidSettingTab(this.app, this));
 	}
 
 	private async loadRagIndex() {
@@ -1695,79 +1697,112 @@ export default class BachelorSaidPlugin extends Plugin {
 
 	async retrieveRelevantChunks(query: string, scopeFiles: TFile[], topK: number): Promise<VectorChunk[]> {
 		const idx = this.ensureRagIndex();
-	  
-		console.groupCollapsed(`[RAG][RETRIEVE] topK=${topK}`);
-		this.logPreview("Query:", query, 250);
-		console.log("Scope files:", scopeFiles.map(f => f.basename));
-	  
-		// Lazy indexing
+	
+		// 1. Lazy Indexing
 		for (const f of scopeFiles) {
 			const fileChunks = idx.chunks.filter(c => c.filePath === f.path);
 			const hasAny = fileChunks.length > 0;
-		  
+			// Wir prüfen, ob indexiert werden muss
 			const newestIndexedMtime = fileChunks.reduce((mx, c) => Math.max(mx, c.mtime ?? 0), 0);
 			const fileMtime = f.stat.mtime;
-		  
-			const needsReindex = !hasAny || fileMtime > newestIndexedMtime;
-		  
-			if (needsReindex) {
-			  console.log(`[RAG][RETRIEVE] Reindex needed: ${f.basename} (fileMtime=${fileMtime}, indexed=${newestIndexedMtime})`);
-			  try {
-				await this.indexNoteFile(f);
-			  } catch (e) {
-				console.warn("[RAG][RETRIEVE] Indexing failed for", f.path, e);
-			  }
+	
+			if (!hasAny || fileMtime > newestIndexedMtime) {
+				try { await this.indexNoteFile(f); } catch (e) { console.warn("Indexing failed", f.path, e); }
 			}
-		}		  
-	  
+		}		
+	
 		const scopePaths = new Set(scopeFiles.map(f => f.path));
 		const candidates = idx.chunks.filter(c => scopePaths.has(c.filePath));
 		if (!candidates.length) return [];
-
+	
+		// 2. Query Analyse
+		const queryTerms = query.toLowerCase()
+			.split(/[\s\?.,;!]+/)
+			.filter(t => t.length >= 3 && !["what", "when", "where", "which", "with", "from", "that", "this", "have", "does", "been", "according"].includes(t));
+		
 		const qVec = await this.embedText(query);
-		const scored = candidates.map(c => ({ chunk: c, score: this.cosineSimilarity(qVec, c.embedding) }));
+	
+		// 3. Scoring
+		const scored = candidates.map(c => {
+			let score = this.cosineSimilarity(qVec, c.embedding);
+			const textLower = c.text.toLowerCase();
+			
+			let boost = 0;
+			let matches = [];
+			
+			for (const term of queryTerms) {
+				if (textLower.includes(term)) {
+					// EXTREMER BOOST: +1.0 pro Wort. 
+					// Das hebelt die Vektor-Suche bei Treffern quasi aus.
+					boost += 1.0; 
+					matches.push(term);
+				}
+			}
+			
+			return { chunk: c, score: score + boost, matches };
+		});
+		
+		// 4. Sortieren & KEIN FILTER MEHR
+		// Wir entfernen den "> 0.3" Filter. Wir nehmen einfach die Besten, egal wie "schlecht" sie mathematisch sind.
 		scored.sort((a, b) => b.score - a.score);
-
-		const top = this.mmrSelect(scored, topK, 0.8);
-
-		// ✅ NEU: neighbor expansion
+		
+		// DEBUG: Das ist für dich! Schau in die Konsole (Strg+Shift+I)
+		console.groupCollapsed(`[RAG] Top Hits for: "${query}"`);
+		scored.slice(0, 5).forEach((x, i) => {
+			console.log(`#${i+1} Score: ${x.score.toFixed(2)} [Matches: ${x.matches.join(', ')}]`);
+			console.log(x.chunk.text.slice(0, 200).replace(/\n/g, " ") + "...");
+		});
+		console.groupEnd();
+	
+		// 5. MMR Selection
+		// Wir nehmen topK Kandidaten für MMR aus den Top 50 scored chunks
+		const candidatesForMMR = scored.slice(0, 50); 
+		const top = this.mmrSelect(candidatesForMMR, topK, 0.5); // 0.5 = Balance zwischen Score und Diversität
+	
+		// 6. Neighbor Expansion
 		const byFile = new Map<string, VectorChunk[]>();
 		for (const c of candidates) {
 			if (!byFile.has(c.filePath)) byFile.set(c.filePath, []);
 			byFile.get(c.filePath)!.push(c);
 		}
-		for (const arr of byFile.values()) arr.sort((a,b)=>a.chunkIndex-b.chunkIndex);
-
+		for (const arr of byFile.values()) arr.sort((a,b) => a.chunkIndex - b.chunkIndex);
+	
 		const expanded: VectorChunk[] = [];
 		const seen = new Set<string>();
-
+	
 		const push = (c: VectorChunk) => {
 			if (seen.has(c.id)) return;
 			seen.add(c.id);
 			expanded.push(c);
 		};
-
+	
 		for (const hit of top) {
 			const c = hit.chunk;
-			push(c);
-
 			const arr = byFile.get(c.filePath)!;
 			const i = arr.findIndex(x => x.id === c.id);
-			if (i >= 0) {
-			if (arr[i - 1]) push(arr[i - 1]); // prev
-			if (arr[i + 1]) push(arr[i + 1]); // next
-			}
+			
+			if (i > 0) push(arr[i - 1]); 
+			push(c);                     
+			if (i < arr.length - 1) push(arr[i + 1]); 
 		}
-
-		// optional: sort by (file, chunkIndex) damit es lesbar ist
-		expanded.sort((a,b)=> (a.filePath.localeCompare(b.filePath)) || (a.chunkIndex - b.chunkIndex));
-		// ✅ Always include meta chunk per file (if present), to make author/year/venue reliably answerable
+	
+		// 7. Metadata hinzufügen
 		for (const f of scopeFiles) {
 			const meta = idx.chunks.find(c => c.filePath === f.path && c.chunkType === "meta");
 			if (meta) {
-			if (!expanded.some(x => x.id === meta.id)) expanded.unshift(meta);
+				if (!seen.has(meta.id)) {
+					seen.add(meta.id);
+					expanded.unshift(meta); 
+				}
 			}
-		}  
+		}
+	
+		// 8. Sortieren nach Dokumentenfluss
+		expanded.sort((a, b) => {
+			if (a.filePath !== b.filePath) return a.filePath.localeCompare(b.filePath);
+			return a.chunkIndex - b.chunkIndex;
+		});
+		
 		return expanded;
 	}
 
@@ -1788,46 +1823,53 @@ export default class BachelorSaidPlugin extends Plugin {
 	}	  
 
 	buildRagPrompt(userQuestion: string, retrieved: VectorChunk[]): string {
-		// Falls ein Meta-Chunk dabei ist, stellen wir sicher, dass er ganz oben steht 
-		// und das Modell nicht durch 12.000 Zeichen Rauschen abgelenkt wird.
-		const isMetaQuery = /author|title|who wrote|venue|published/i.test(userQuestion);
-		
-		// Bei Meta-Anfragen reduzieren wir die maximale Länge massiv, 
-		// damit die Aufmerksamkeit des LLM voll auf den ersten Chunks liegt.
-		const MAX_TOTAL = isMetaQuery ? 4000 : 12000; 
+		// Llama 3.1 hat 128k Context Window. 
+		// Wir nutzen 65.000 Zeichen (ca. 15k-20k Token), das ist sicher und billig.
+		const MAX_TOTAL = 65000; 
 		
 		let used = 0;
 		const blocks: string[] = [];
 		
-		// Sortiere retrieved so, dass 'meta' immer an Index 0 ist (falls nicht schon geschehen)
+		// Sortierung: Meta zuerst, dann Dokumentenfluss
 		const sorted = [...retrieved].sort((a, b) => {
 			if (a.chunkType === "meta") return -1;
 			if (b.chunkType === "meta") return 1;
-			return 0;
+			if (a.filePath === b.filePath) return a.chunkIndex - b.chunkIndex;
+			return a.filePath.localeCompare(b.filePath);
 		});
 	
 		for (let i = 0; i < sorted.length; i++) {
 			const c = sorted[i];
-			const header = `[#${i + 1}] SOURCE TYPE: ${(c.chunkType ?? "body").toUpperCase()}\n`;			const remain = MAX_TOTAL - used - header.length;
-			if (remain <= 200) break;
+			
+			const sourceInfo = c.fileName;
+			const sectionInfo = c.section ? ` (Section: ${c.section})` : "";
+			const header = `\n[SOURCE: ${sourceInfo}${sectionInfo}]\n`;
+			
+			const remain = MAX_TOTAL - used - header.length;
+			if (remain <= 150) break;
 	
 			const snippet = c.text.length > remain ? c.text.slice(0, remain) + "..." : c.text;
+			
 			blocks.push(header + snippet);
 			used += header.length + snippet.length;
 		}
 	
-		return `You are a precise academic record keeper.
-		
-	### CRITICAL RULE:
-	The block marked "SOURCE TYPE: META" contains the definitive bibliographic data.
-	If the user asks for authors, you MUST list the names found in the META block.
+		return `You are an expert academic research assistant.
 	
-	--- CONTEXT ---
-	${blocks.join("\n\n")}
-	--- END CONTEXT ---
+	### INSTRUCTIONS:
+	1. Answer the user's question using ONLY the provided context snippets below.
+	2. The context contains snippets from different parts of a paper. **Read ALL snippets** before answering.
+	3. **Synthesis is key:** If the answer is split across multiple snippets, combine them.
+	4. If text seems garbled (e.g. missing spaces), try to reconstruct the meaning.
+	5. Cite the source using the format [File Name].
 	
-	Question: ${userQuestion}
-	Final Answer:`;
+	--- CONTEXT START ---
+	${blocks.join("\n")}
+	--- CONTEXT END ---
+	
+	User Question: ${userQuestion}
+	
+	Answer:`;
 	}
 	
 	private cleanWikiLinks(text: string): string {
@@ -2856,14 +2898,18 @@ JSON OUTPUT:`;
 			const metadataBuffer = fileBuffer.slice(0);
 			const binaryBuffer = fileBuffer.slice(0);
 			
+			// 1. PDF Text extrahieren
 			const { text: pdfText, metadata: pdfInternalMetadata } = await this.extractPDFContent(metadataBuffer);
 	
-			const title = file.name.replace(/\.pdf$/i, "").trim();
+			// Fallback: Dateiname als Startpunkt
+			const filenameBase = file.name.replace(/\.pdf$/i, "").trim();
+			
 			const cleanedText = await this.preCleanText(pdfText);
 			const firstChunk = cleanedText.slice(0, 8000); 
 	
 			// === Step 1: Metadata Extraction ===
 			const llamaPrompt = `Extract the following metadata from this academic paper content. ONLY return in this format:
+	Title: [Exact Title of the Paper]
 	Authors: [List of authors separated by commas]
 	Conference: [Conference or Journal Name]
 	Keywords: [List of keywords separated by commas]
@@ -2876,12 +2922,34 @@ JSON OUTPUT:`;
 			const llamaResponse = await this.processWithLlama3(llamaPrompt);
 			const content = llamaResponse.message.content.trim();
 	
+			// --- Parsing der LLM Antwort ---
+			
+			// 1. Titel extrahieren
+			const titleMatch = content.match(/Title:\s*(.+)/i);
+			let realTitle = titleMatch ? titleMatch[1].trim() : "";
+			
+			realTitle = realTitle.replace(/^["']+|["']+$/g, "").trim();
+			
+			if (!realTitle || realTitle.length < 5 || realTitle.toLowerCase().includes("unknown title")) {
+				console.warn("LLM did not find a valid title. Using filename fallback.");
+				realTitle = filenameBase;
+			}
+			
+			// === FIX: Titel sofort bereinigen ===
+			// Wir erzeugen HIER schon den dateisystem-konformen Namen.
+			// Damit stellen wir sicher, dass Link und Dateiname 100% identisch sind.
+			let safeTitle = this.sanitizeFileName(realTitle);
+			if (safeTitle.endsWith(".")) safeTitle = safeTitle.slice(0, -1);
+
+			// Der "Titel für die Notiz" ist jetzt der bereinigte Name (mit Bindestrich statt Doppelpunkt)
+			const titleForNote = safeTitle; 
+
 			const authorsMatch = content.match(/Authors:\s*(.+)/i);
 			const confMatch = content.match(/Conference:\s*(.+)/i);
 			const keywordsMatch = content.match(/Keywords:\s*(.+)/i);
 			const emailsMatch = content.match(/Emails:\s*(.*)/i);
+			
 			let emails = emailsMatch ? emailsMatch[1].split(/[,;]/).map(e => e.trim()).filter(Boolean) : [];
-
 			if (!emails.length) emails = this.extractEmails(firstChunk);
 	
 			const authors = authorsMatch ? authorsMatch[1].split(/,| and /).map(a => a.trim()) : ["Unknown Author"];
@@ -2899,14 +2967,16 @@ JSON OUTPUT:`;
 					: "Unknown Year";
 	
 			const createdDate = new Date().toISOString().slice(0, 10);
-			const titleLink = `[[${title.replace(/"/g, "'")}]]`;
+			
+			// Links generieren (WICHTIG: titleForNote ist jetzt bereits 'clean')
+			const titleLink = `[[${titleForNote}]]`; 
 			const authorLinks = finalAuthors.map(a => `[[${a}]]`);
 			const conferenceLink = `[[${conferenceOrJournal.replace(/"/g, "'")}]]`;
 			const keywordLinks = keywords.map(k => `[[${k}]]`);
 			
 			const yamlFrontmatter = [
 				"---",
-				`title: "${titleLink}"`, 
+				`title: "${titleLink}"`, // Hier steht jetzt [[Titel - Untertitel]] -> MATCHT DATEINAMEN!
 				`date: ${createdDate}`,
 				"author:",
 				...authorLinks.map(a => `  - "${a.replace(/"/g, "'")}"`),
@@ -2927,8 +2997,8 @@ JSON OUTPUT:`;
 				"" 
 			].join("\n");
 	
-			// === Step 2: Summarize in Chunks ===
-			loadingModal.updateContent(`<i>Metadata extracted. Summarizing full paper in chunks...</i>`);
+			// === Step 2: Summarize ===
+			loadingModal.updateContent(`<i>Metadata extracted: "${titleForNote}". Summarizing...</i>`);
 	
 			const maxChunkSize = 8000;
 			const chunks: string[] = [];
@@ -2944,14 +3014,12 @@ JSON OUTPUT:`;
 	---
 	${chunk}
 	---`;
-	
 				const chunkResponse = await this.processWithLlama3(chunkPrompt);
 				summaries.push(chunkResponse.message.content.trim());
 			}
 	
-			loadingModal.updateContent(`<i>Consolidating summaries into a final paragraph...</i>`);
+			loadingModal.updateContent(`<i>Consolidating summaries...</i>`);
 			const consolidatePrompt = `You are given several partial summaries from chunks of an academic paper. Combine them into one concise, cohesive summary paragraph.
-			
 	--- PARTIAL SUMMARIES ---
 	${summaries.map((s, idx) => `Summary ${idx + 1}: ${s}`).join('\n\n')}
 	--- END ---`;
@@ -2959,76 +3027,58 @@ JSON OUTPUT:`;
 			const finalSummaryResponse = await this.processWithLlama3(consolidatePrompt);
 			const finalSummary = finalSummaryResponse.message.content.trim();
 			
-			// === ZITATE & REFERENZEN EXTRAHIEREN (MIT LINK GENERIERUNG) ===
-			
-            // Array zum Sammeln der Links für den Full Text Bereich
-            let extractedReferenceLinks: string[] = [];
+			// === ZITATE & REFERENZEN ===
+			let extractedReferenceLinks: string[] = [];
 
 			try {
 				const refBlockRaw = this.extractReferencesBlock(cleanedText);
-				
 				if (refBlockRaw.length > 0 && refBlockRaw[0].length > 100) {
 					loadingModal.updateContent(`<i>🔍 Found references. Analyzing...</i>`);
-					
 					const extractedRefs = await this.extractStructuredReferences(refBlockRaw[0]);
 					
-					let createdCount = 0;
 					for (const ref of extractedRefs) {
 						if (ref.isAcademic) {
-							// 1. Notiz in 04_quellen erstellen (oder ignorieren wenn existiert)
 							await this.upsertCitedPaperNote(ref).catch(e => console.warn("Ref error", e));
-							createdCount++;
 
-                            // 2. Link generieren für den Footer
-                            const refTitle = (ref.title ?? "").trim();
-                            if (refTitle && refTitle.length > 10) {
-                                // Logik: Prüfen ob in 01_papers (Upgrade) oder 04_quellen
-                                let targetBasename = "";
-                                
-                                const existingPaper = await this.findExistingPaperNote(refTitle);
-                                if (existingPaper) {
-                                    // Ziel: 01_papers (oder bereits existierende Quelle)
-                                    targetBasename = existingPaper.basename;
-                                } else {
-                                    // Ziel: 04_quellen (Name berechnen wie in upsertCitedPaperNote)
-                                    let safeBase = this.sanitizeFileName(refTitle);
-                                    if (safeBase.endsWith(".")) safeBase = safeBase.slice(0, -1);
-                                    targetBasename = safeBase;
-                                }
-                                
-                                extractedReferenceLinks.push(`- [[${targetBasename}]]`);
-                            }
+							const refTitle = (ref.title ?? "").trim();
+							if (refTitle && refTitle.length > 10) {
+								const cleanRefTitle = refTitle.trim().replace(/[.,;:]+$/, "");
+								let targetBasename = "";
+								
+								const existingPaper = await this.findExistingPaperNote(cleanRefTitle);
+								if (existingPaper) {
+									targetBasename = existingPaper.basename;
+								} else {
+									let safeBase = this.sanitizeFileName(cleanRefTitle);
+									if (safeBase.endsWith(".")) safeBase = safeBase.slice(0, -1);
+									targetBasename = safeBase;
+								}
+								extractedReferenceLinks.push(`- [[${targetBasename}]]`);
+							}
 						}
 					}
-					console.log(`Created ${createdCount} new notes from references.`);
 				}
 			} catch (refError) {
-				console.error("Reference extraction failed (non-critical):", refError);
-				new Notice("Skipped reference extraction due to AI error.");
+				console.error("Reference extraction failed:", refError);
 			}
 
-			// === Save PDF to Vault ===
+			// === Save PDF ===
 			const pdfFolder = "pdf";
 			if (!this.app.vault.getAbstractFileByPath(pdfFolder)) {
 				await this.app.vault.createFolder(pdfFolder).catch(() => {});
 			}
-	
 			const pdfFileName = `${pdfFolder}/${file.name}`;
 			if (!this.app.vault.getAbstractFileByPath(pdfFileName)) {
 				await this.app.vault.createBinary(pdfFileName, binaryBuffer);
 			}
-	
 			const pdfEmbed = `![[${pdfFileName}]]`;
 	
-			// === Final Note Body Construct ===
-            
-            // Referenzen-Block bauen (nur wenn Links vorhanden)
-            let referenceSection = "";
-            if (extractedReferenceLinks.length > 0) {
-                // Duplikate entfernen und sortieren
-                const uniqueLinks = [...new Set(extractedReferenceLinks)].sort();
-                referenceSection = `\n${uniqueLinks.join("\n")}`;
-            }
+			// === Final Note Body ===
+			let referenceSection = "";
+			if (extractedReferenceLinks.length > 0) {
+				const uniqueLinks = [...new Set(extractedReferenceLinks)].sort();
+				referenceSection = `\n${uniqueLinks.join("\n")}`;
+			}
 
 			const noteBody =
 			yamlFrontmatter +
@@ -3045,8 +3095,9 @@ ${referenceSection}
 ${pdfEmbed}
 `;
 	
-			// === NEUE LOGIK: Check, Move & Upgrade ===
-			const existingNote = await this.findExistingPaperNote(title);
+			// === CHECK, MOVE & UPGRADE (Mit safeTitle) ===
+			// Wir suchen nach der Datei, die GENAU so heißt wie titleForNote (der ja schon safe ist)
+			const existingNote = await this.findExistingPaperNote(titleForNote); 
 			let finalFile: TFile;
 
 			if (existingNote) {
@@ -3054,15 +3105,15 @@ ${pdfEmbed}
 				const isInPapers = existingNote.path.startsWith(this.PAPERS_DIR);
 
 				if (isInPapers) {
-					new Notice("Paper already exists in library.");
+					new Notice(`Paper "${titleForNote}" already exists.`);
 					finalFile = existingNote;
 				} 
 				else if (isInQuellen) {
-					loadingModal.updateContent(`<i>Found reference. Upgrading to full paper...</i>`);
-					const newPath = `${this.PAPERS_DIR}/${existingNote.name}`;
+					loadingModal.updateContent(`<i>Upgrading existing reference...</i>`);
+					const newPath = `${this.PAPERS_DIR}/${titleForNote}.md`; // titleForNote ist schon safe
 					
 					if (this.app.vault.getAbstractFileByPath(newPath)) {
-						new Notice("Target filename busy. Updating existing reference note instead.");
+						new Notice("Target filename busy. Updating content.");
 						await this.app.vault.modify(existingNote, noteBody);
 						finalFile = existingNote;
 					} else {
@@ -3070,42 +3121,40 @@ ${pdfEmbed}
 						await new Promise(r => setTimeout(r, 100));
 						await this.app.vault.modify(existingNote, noteBody);
 						finalFile = existingNote;
-						new Notice(`Upgraded reference to full paper.`);
+						new Notice(`Upgraded reference to: ${titleForNote}`);
 					}
 				} else {
 					finalFile = existingNote;
 				}
 
 			} else {
-				// FALL C: Neue Datei erstellen
+				// NEUE DATEI
 				await this.ensureFolder(this.PAPERS_DIR);
-				let safeTitle = this.sanitizeFileName(title);
-                if (safeTitle.endsWith(".")) safeTitle = safeTitle.slice(0, -1);
-                
-				let noteFileName = `${this.PAPERS_DIR}/${safeTitle}.md`;
+				
+				let noteFileName = `${this.PAPERS_DIR}/${titleForNote}.md`; // titleForNote ist schon safe
 				
 				if (this.app.vault.getAbstractFileByPath(noteFileName)) {
-					noteFileName = `${this.PAPERS_DIR}/${safeTitle} (1).md`;
+					noteFileName = `${this.PAPERS_DIR}/${titleForNote} (1).md`;
 				}
 
 				if (!this.app.vault.getAbstractFileByPath(noteFileName)) {
 					finalFile = await this.app.vault.create(noteFileName, noteBody);
-					new Notice(`Imported new paper: ${title}`);
+					new Notice(`Imported: ${titleForNote}`);
 				} else {
-					new Notice("Error: Could not create file (duplicate name).");
+					new Notice("Error: File collision.");
 					loadingModal.close();
 					return;
 				}
 			}
 
-			// Person & Conference Notes aktualisieren
+			// Update Person/Conference Notes mit dem BEREINIGTEN Titel
 			for (const a of finalAuthors) {
 				if (a && a !== "Unknown Author") {
-					await this.upsertPersonNote(a, title);
+					await this.upsertPersonNote(a, titleForNote);
 				}
 			}
 			if (conferenceOrJournal && conferenceOrJournal !== "Unknown Conference/Journal") {
-				await this.upsertConferenceNote(conferenceOrJournal, String(year), title);
+				await this.upsertConferenceNote(conferenceOrJournal, String(year), titleForNote);
 			}
 
 			if (finalFile) {
@@ -3117,12 +3166,8 @@ ${pdfEmbed}
 			
 		} catch (error: any) {
 			const msg = String(error?.message ?? error);
-			if (msg.toLowerCase().includes("file already exists")) {
-				new Notice("File collision detected during import.");
-			} else {
-				new Notice("Failed to process PDF: " + msg.slice(0, 100));
-			}
 			console.error("Error processing dropped PDF:", error);
+			new Notice("Failed to process PDF: " + msg.slice(0, 100));
 			try { document.querySelectorAll('.modal-container').forEach(m => m.remove()); } catch(e) {}
 		}
 	}
@@ -3709,5 +3754,98 @@ ${pdfEmbed}
 
 	async saveSettings() {
 		await this.saveData(this.settings);
+	}
+}
+
+class BachelorSaidSettingTab extends PluginSettingTab {
+	plugin: BachelorSaidPlugin;
+
+	constructor(app: App, plugin: BachelorSaidPlugin) {
+		super(app, plugin);
+		this.plugin = plugin;
+	}
+
+	display(): void {
+		const { containerEl } = this;
+		containerEl.empty();
+
+		containerEl.createEl('h2', { text: 'RAG & LLM Einstellungen' });
+
+		// --- API KEYS ---
+		new Setting(containerEl)
+			.setName('Groq API Key')
+			.setDesc('Benötigt für Llama 3.')
+			.addText(text => text
+				.setPlaceholder('gsk_...')
+				.setValue(this.plugin.settings.groqApiKey)
+				.onChange(async (value) => {
+					this.plugin.settings.groqApiKey = value;
+					await this.plugin.saveSettings();
+				}));
+
+		// --- RAG PARAMETER ---
+		containerEl.createEl('h3', { text: 'RAG Parameter (Wichtig für Präzision)' });
+
+		new Setting(containerEl)
+			.setName('Top K Retrieval')
+			.setDesc('Wie viele Text-Schnipsel sollen an das LLM gesendet werden? (Höher = mehr Kontext, aber langsamer). Empfohlen: 15-20.')
+			.addSlider(slider => slider
+				.setLimits(1, 30, 1) // Min 1, Max 30, Schritt 1
+				.setValue(this.plugin.settings.topK)
+				.setDynamicTooltip()
+				.onChange(async (value) => {
+					this.plugin.settings.topK = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Chunk Size')
+			.setDesc('Größe der Textblöcke (Zeichen). Kleiner ist oft präziser. Empfohlen: 1200-1500.')
+			.addText(text => text
+				.setPlaceholder('1500')
+				.setValue(String(this.plugin.settings.chunkSize))
+				.onChange(async (value) => {
+					const num = parseInt(value);
+					if (!isNaN(num)) {
+						this.plugin.settings.chunkSize = num;
+						await this.plugin.saveSettings();
+					}
+				}));
+
+		new Setting(containerEl)
+			.setName('Chunk Overlap')
+			.setDesc('Überlappung der Blöcke, damit Sätze nicht abgeschnitten werden.')
+			.addText(text => text
+				.setPlaceholder('300')
+				.setValue(String(this.plugin.settings.chunkOverlap))
+				.onChange(async (value) => {
+					const num = parseInt(value);
+					if (!isNaN(num)) {
+						this.plugin.settings.chunkOverlap = num;
+						await this.plugin.saveSettings();
+					}
+				}));
+
+		// --- INDEX MANAGEMENT ---
+		containerEl.createEl('h3', { text: 'Datenbank Management' });
+
+		new Setting(containerEl)
+			.setName('RAG Index leeren')
+			.setDesc('Löscht die Vektor-Datenbank. Nötig, wenn du Chunk Size geändert hast.')
+			.addButton(btn => btn
+				.setButtonText('⚠️ Clear Index')
+				.setWarning()
+				.onClick(async () => {
+					// @ts-ignore (Zugriff auf private Methode oder Logik direkt hier)
+					if (this.plugin.ragIndexPath && await this.plugin.app.vault.adapter.exists(this.plugin.ragIndexPath)) {
+						await this.plugin.app.vault.adapter.remove(this.plugin.ragIndexPath);
+						// Reset memory cache
+						// @ts-ignore
+						this.plugin.ragIndex = { version: 1, embeddingModel: this.plugin.settings.embeddingModel, chunks: [] };
+						new Notice('Index gelöscht. Bitte stelle eine Frage, um neu zu indexieren.');
+					} else {
+						new Notice('Index ist bereits leer.');
+					}
+				}));
 	}
 }
