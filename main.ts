@@ -113,6 +113,7 @@ export class ChatView extends ItemView {
 	public modeSelect!: HTMLSelectElement;
 	private noteListEl!: HTMLDivElement;
 	private extraNotes: TFile[] = [];
+	private saveCheckbox!: HTMLInputElement;
 	private wikiToPlain(s: string): string {
 		// [[A|B]] -> B, [[B]] -> B, sonst trim
 		const t = String(s).trim();
@@ -298,6 +299,34 @@ export class ChatView extends ItemView {
 		  background: 'var(--background-secondary)',
 		  cursor: 'pointer'
 		});
+
+		// ============================================================
+        // --- NEU: Checkbox für Auto-Save ---
+        // ============================================================
+        const saveWrapper = headerRight.createDiv();
+        Object.assign(saveWrapper.style, {
+            display: 'flex',
+            alignItems: 'center',
+            gap: '4px',
+            marginLeft: '8px',
+            paddingLeft: '8px',
+            borderLeft: '1px solid var(--background-modifier-border)', // Kleiner Trennstrich
+            fontSize: '11px',
+            opacity: '0.85'
+        });
+
+        this.saveCheckbox = saveWrapper.createEl('input', { type: 'checkbox' });
+        this.saveCheckbox.id = 'llm-save-chat';
+        this.saveCheckbox.style.margin = '0';
+        this.saveCheckbox.style.cursor = 'pointer';
+        
+        // Standardmäßig AUS (false), damit nicht gespammt wird
+        this.saveCheckbox.checked = false; 
+
+        const saveLabel = saveWrapper.createEl('label', { text: 'Save Chat' });
+        saveLabel.htmlFor = 'llm-save-chat';
+        saveLabel.style.cursor = 'pointer';
+        // ============================================================
 
 		// Controls row
 		const controls = root.createDiv({ cls: 'llm-chat-controls' });
@@ -800,7 +829,10 @@ export class ChatView extends ItemView {
 				this.renderMessages();
 				}
 
-				await this.plugin.saveChatToNote(this.messages);
+				if (this.saveCheckbox && this.saveCheckbox.checked) {
+					await this.plugin.saveChatToNote(this.messages);
+					new Notice("Chat progress saved."); 
+				}
 				return;
 			}					
 	  
@@ -835,7 +867,10 @@ export class ChatView extends ItemView {
 		  this.renderMessages();
 		}
 	  
-		await this.plugin.saveChatToNote(this.messages);
+		if (this.saveCheckbox && this.saveCheckbox.checked) {
+			await this.plugin.saveChatToNote(this.messages);
+			new Notice("Chat progress saved."); 
+		}
 	}	  
 
 	async onClose() {
@@ -2205,27 +2240,37 @@ export default class BachelorSaidPlugin extends Plugin {
 	private extractReferencesBlock(fullText: string): string[] {
 		if (!fullText || fullText.length < 500) return [];
 
-		// Wir schauen uns nur die letzten 40% des Textes an, um Performance zu sparen 
-		// und das Inhaltsverzeichnis am Anfang zu ignorieren.
-		const searchArea = fullText.slice(Math.floor(fullText.length * 0.6));
+		// Erweitere den Suchbereich auf die letzten 50% (statt 40%), 
+		// falls nach den Referenzen noch viel Anhang/Bios kommen.
+		const searchArea = fullText.slice(Math.floor(fullText.length * 0.5));
 		
-		// Regex für typische Überschriften (case-insensitive)
-		// Erlaubt: "References", "Bibliography", "Literature", "Cited Works"
-		// Muss auf einer eigenen Zeile stehen (oder fast).
-		const refHeaderRegex = /(?:^|\n)\s*(?:[0-9]*\.?)\s*(?:References|Bibliography|Literatur|LITERATURVERZEICHNIS|Quellenverzeichnis)\s*(?:\n|$)/i;
+		// ROBUSTER REGEX:
+		// 1. Erlaubt "References" am Zeilenanfang
+		// 2. Erlaubt Doppelpunkt oder Punkt danach
+		// 3. WICHTIG: Erlaubt danach entweder Zeilenumbruch (\n) ODER eine Referenzklammer (\[)
+		const refHeaderRegex = /(?:^|\n)\s*(?:\d+\.?\s*)?(?:References|Bibliography|Literatur|LITERATURVERZEICHNIS|Quellenverzeichnis|Reference)(?:[:\.]?)(?:\s*\n|\s+\[)/i;
 
 		const match = searchArea.match(refHeaderRegex);
 
 		if (match && match.index !== undefined) {
-			// Wir haben den Header gefunden. Wir nehmen alles danach.
-			// Wir addieren den Offset (0.6 * length) wieder dazu.
-			const absoluteIndex = Math.floor(fullText.length * 0.6) + match.index;
-			const referencesText = fullText.slice(absoluteIndex + match[0].length);
+			console.log("[RefExtractor] Found references header:", match[0].trim());
+			const absoluteIndex = Math.floor(fullText.length * 0.5) + match.index;
 			
-			// Optional: Rauschen bereinigen (Seitenzahlen etc.)
-			return [referencesText.trim()];
-		}
+			// Wir schneiden ab dem Match ab, aber behalten den Text danach
+			// match[0] enthält den Header. Wir wollen alles DANACH.
+			// Aber wenn der Header "References [1]" ist, müssen wir aufpassen, dass wir "[1]" nicht wegschneiden.
+			
+			let startOfContent = absoluteIndex + match[0].length;
+			
+			// Fallback: Wenn der Header "[1]" enthält (Merged Line), müssen wir zurückrudern
+			if (match[0].includes("[")) {
+				startOfContent = absoluteIndex + match[0].indexOf("[");
+			}
 
+			return [fullText.slice(startOfContent).trim()];
+		}
+		
+		console.warn("[RefExtractor] No references header found in text snippet (Length: " + searchArea.length + ")");
 		return [];
 	}
 
@@ -2620,8 +2665,9 @@ date: ${new Date().toISOString().slice(0, 10)}
 	}
 
 	private async extractStructuredReferences(referencesRaw: string): Promise<any[]> {
-		// Kürzen, um Token zu sparen
-		const truncatedRefs = referencesRaw.slice(0, 15000);
+		// 1. Text begrenzen, damit wir nicht sofort ins Limit laufen
+		// Wir nehmen nur die ersten 12.000 Zeichen der Referenzen. Das reicht für ca. 30-50 Papers.
+		const truncatedRefs = referencesRaw.slice(0, 12000);
 
 		const refPrompt = `You are a machine that outputs strict JSON. You do not speak.
 Task: Extract academic references from the text below.
@@ -2631,48 +2677,53 @@ ${truncatedRefs}
 
 INSTRUCTIONS:
 1. Identify academic papers/books. Ignore websites.
-2. Fix broken lines.
-3. OUTPUT FORMAT: STRICT JSON Array of objects with keys: "title", "authors" (array), "year", "venue", "isAcademic" (boolean).
-4. ESCAPE all backslashes (e.g. use "\\\\" for LaTeX) and quotes inside strings.
-5. Do NOT use Markdown code blocks. Just the raw JSON string.
+2. OUTPUT FORMAT: STRICT JSON Array of objects with keys: "title", "authors" (array), "year", "venue", "isAcademic" (boolean).
+3. ESCAPE all backslashes and quotes properly.
+4. Do NOT use Markdown code blocks. Just the raw JSON string.
 
 JSON OUTPUT:`;
 	
 		const response = await this.processWithLlama3(refPrompt);
 		let content = response.message.content.trim();
 
-		// Markdown Code-Blöcke entfernen, falls das LLM sie doch schreibt
+		// Cleanup Markdown
 		content = content.replace(/^```json/, '').replace(/^```/, '').replace(/```$/, '').trim();
 
+		// --- RETTUNGS-LOGIK FÜR ABGESCHNITTENES JSON ---
 		try {
-			// VERSUCH 1: Direkte JSON Suche
-			const jsonMatch = content.match(/\[\s*\{[\s\S]*\}\s*\]/);
-			if (jsonMatch) {
-				const jsonString = jsonMatch[0];
+			// Versuch 1: Ist es valides JSON?
+			return JSON.parse(content);
+		} catch (e) {
+			console.warn("[RefExtractor] JSON parsing failed (likely truncated). Attempting repair...");
+			
+			const recoveredItems: any[] = [];
+			
+			// Versuch 2: Wir suchen mit Regex nach einzelnen, kompletten Objekten { ... }
+			// Dieser Regex findet alles zwischen { und }, was wie ein Objekt aussieht.
+			// Er ist "lazy" (*?), damit er einzelne Objekte findet, nicht das erste { bis zum allerletzten }.
+			const objectMatches = content.matchAll(/\{[^{}]*\}/g);
+			
+			for (const match of objectMatches) {
 				try {
-					return JSON.parse(jsonString);
-				} catch (innerError) {
-					// VERSUCH 1.5: Häufige JSON-Fehler bereinigen
-					// Backslashes, die nicht escaped sind, korrigieren (oft in LaTeX Titeln)
-					// Dies ist ein naiver Fix, hilft aber oft bei "Bad escaped character"
-					const sanitized = jsonString.replace(/\\/g, "\\\\"); 
-					try {
-						return JSON.parse(sanitized);
-					} catch (e) {
-						console.warn("JSON sanitization failed:", e);
-						throw e; // Weiter zum Fallback
+					// Wir versuchen, den einzelnen Schnipsel zu parsen
+					const item = JSON.parse(match[0]);
+					// Einfacher Check, ob es sinnvolle Daten sind
+					if (item.title || item.authors) {
+						recoveredItems.push(item);
 					}
+				} catch (innerE) {
+					// Manchmal ist ein } innerhalb des Titels, das ignoriert unser einfacher Regex.
+					// Wir ignorieren kaputte Objekte einfach.
 				}
 			}
-			throw new Error("No JSON array found");
 
-		} catch (e) {
-			console.warn("LLM did not return valid JSON. Switching to text fallback parsing...", e);
-			
-			// VERSUCH 2: Fallback für nummerierte Listen
-			// Wenn JSON knallt, nehmen wir einfach den Text-Parser. 
-			// Das verhindert den Absturz des Plugins.
-			return this.parseFallbackTextList(content);
+			if (recoveredItems.length > 0) {
+				console.log(`[RefExtractor] Recovered ${recoveredItems.length} references from broken JSON.`);
+				return recoveredItems;
+			}
+
+			// Versuch 3: Wenn gar kein JSON da war, Fallback auf Text-Parser
+			return this.parseFallbackTextList(truncatedRefs); // Nutze den Original-Input, nicht den LLM Output!
 		}
 	}
 
